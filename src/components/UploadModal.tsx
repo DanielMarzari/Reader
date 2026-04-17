@@ -2,66 +2,48 @@
 
 import { useRef, useState } from "react";
 
+export type UploadRequest =
+  | { kind: "file"; file: File; title?: string }
+  | { kind: "text"; text: string; title?: string };
+
 export function UploadModal({
   open,
   onClose,
-  onUploaded,
+  onSubmit,
 }: {
   open: boolean;
   onClose: () => void;
-  onUploaded: (id: string) => void;
+  onSubmit: (req: UploadRequest) => void;
 }) {
   const [mode, setMode] = useState<"file" | "paste">("file");
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   if (!open) return null;
 
-  async function submit() {
+  function submit() {
     setError(null);
-    setBusy(true);
-    try {
-      let res: Response;
-      if (mode === "file") {
-        if (!file) {
-          setError("Choose a PDF, EPUB, or text file.");
-          setBusy(false);
-          return;
-        }
-        const fd = new FormData();
-        fd.append("file", file);
-        if (title.trim()) fd.append("title", title.trim());
-        res = await fetch("/api/documents", { method: "POST", body: fd });
-      } else {
-        if (!text.trim()) {
-          setError("Paste some text.");
-          setBusy(false);
-          return;
-        }
-        res = await fetch("/api/documents", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, title: title.trim() || undefined }),
-        });
+    if (mode === "file") {
+      if (!file) {
+        setError("Choose a PDF, EPUB, or text file.");
+        return;
       }
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error(j.error || `Upload failed (${res.status})`);
+      onSubmit({ kind: "file", file, title: title.trim() || undefined });
+    } else {
+      if (!text.trim()) {
+        setError("Paste some text.");
+        return;
       }
-      const j = await res.json();
-      onUploaded(j.id);
-      setFile(null);
-      setText("");
-      setTitle("");
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
+      onSubmit({ kind: "text", text, title: title.trim() || undefined });
     }
+    // Reset for next time and close
+    setFile(null);
+    setText("");
+    setTitle("");
+    onClose();
   }
 
   return (
@@ -120,14 +102,12 @@ export function UploadModal({
               className="block w-full text-sm file:mr-3 file:rounded-md file:border file:border-[color:var(--border)] file:bg-[color:var(--surface-2)] file:px-3 file:py-2 file:text-sm file:cursor-pointer"
             />
             <p className="text-xs text-[color:var(--muted)] mt-2">
-              Supported: PDF, EPUB, TXT, MD
+              Supported: PDF, EPUB, TXT, MD. Large PDFs can take 10–30 seconds to parse in the background.
             </p>
           </div>
         ) : (
           <div>
-            <label className="block text-sm mb-1 text-[color:var(--muted)]">
-              Text
-            </label>
+            <label className="block text-sm mb-1 text-[color:var(--muted)]">Text</label>
             <textarea
               className="input w-full h-48 font-sans"
               placeholder="Paste your text here…"
@@ -137,16 +117,14 @@ export function UploadModal({
           </div>
         )}
 
-        {error && (
-          <div className="mt-3 text-sm text-red-500">{error}</div>
-        )}
+        {error && <div className="mt-3 text-sm text-red-500">{error}</div>}
 
         <div className="flex gap-2 justify-end mt-6">
-          <button className="btn" onClick={onClose} disabled={busy}>
+          <button className="btn" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn btn-primary" onClick={submit} disabled={busy}>
-            {busy ? "Uploading…" : "Add"}
+          <button className="btn btn-primary" onClick={submit}>
+            Add
           </button>
         </div>
       </div>

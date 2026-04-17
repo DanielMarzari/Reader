@@ -2,8 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { DocumentSummary, Collection } from "@/types/document";
-import { UploadModal } from "@/components/UploadModal";
+import { UploadModal, type UploadRequest } from "@/components/UploadModal";
 import { DocumentCard } from "@/components/DocumentCard";
+import { PendingUploadCard, type PendingUpload } from "@/components/PendingUploadCard";
 
 type SortKey = "recent" | "title" | "type";
 
@@ -12,6 +13,7 @@ export default function LibraryPage() {
   const [collections, setCollections] = useState<(Collection & { documentCount: number })[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [pending, setPending] = useState<PendingUpload[]>([]);
   const [search, setSearch] = useState("");
   const [activeCollection, setActiveCollection] = useState<string | null>(null);
   const [view, setView] = useState<"grid" | "list">("grid");
@@ -33,6 +35,51 @@ export default function LibraryPage() {
   useEffect(() => {
     loadAll();
   }, []);
+
+  async function startUpload(req: UploadRequest) {
+    const tempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const name =
+      req.kind === "file"
+        ? req.title || req.file.name
+        : req.title || req.text.slice(0, 60).replace(/\s+/g, " ") + (req.text.length > 60 ? "…" : "");
+    setPending((p) => [{ tempId, name, status: "uploading" }, ...p]);
+
+    try {
+      let res: Response;
+      if (req.kind === "file") {
+        const fd = new FormData();
+        fd.append("file", req.file);
+        if (req.title) fd.append("title", req.title);
+        res = await fetch("/api/documents", { method: "POST", body: fd });
+      } else {
+        res = await fetch("/api/documents", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: req.text, title: req.title }),
+        });
+      }
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || `Upload failed (${res.status})`);
+      }
+      await res.json();
+      // Remove the pending entry and reload list
+      setPending((p) => p.filter((x) => x.tempId !== tempId));
+      loadAll();
+    } catch (err) {
+      setPending((p) =>
+        p.map((x) =>
+          x.tempId === tempId
+            ? { ...x, status: "error", error: (err as Error).message }
+            : x
+        )
+      );
+    }
+  }
+
+  function dismissPending(tempId: string) {
+    setPending((p) => p.filter((x) => x.tempId !== tempId));
+  }
 
   async function handleDelete(id: string) {
     if (!confirm("Delete this document? This cannot be undone.")) return;
@@ -81,7 +128,6 @@ export default function LibraryPage() {
 
   return (
     <div className="min-h-screen">
-      {/* Top bar */}
       <header className="sticky top-0 z-30 bg-[color:var(--background)]/85 backdrop-blur border-b border-[color:var(--border)]">
         <div className="flex items-center justify-between gap-3 px-5 py-3 max-w-[1400px] mx-auto">
           <div className="flex items-center gap-2">
@@ -105,7 +151,6 @@ export default function LibraryPage() {
       </header>
 
       <div className="max-w-[1400px] mx-auto flex">
-        {/* Sidebar */}
         <aside className="w-60 shrink-0 border-r border-[color:var(--border)] p-4 hidden md:block">
           <div className="text-xs uppercase tracking-wider text-[color:var(--muted)] mb-2">
             Library
@@ -178,11 +223,13 @@ export default function LibraryPage() {
           )}
         </aside>
 
-        {/* Main */}
         <main className="flex-1 p-5 min-w-0">
           <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
             <div className="text-[color:var(--muted)] text-sm">
               {filtered.length} {filtered.length === 1 ? "item" : "items"}
+              {pending.length > 0 && (
+                <span> · {pending.filter((p) => p.status === "uploading").length} uploading</span>
+              )}
               {activeCollection && (
                 <span> in {collections.find((c) => c.id === activeCollection)?.name}</span>
               )}
@@ -200,9 +247,7 @@ export default function LibraryPage() {
               <div className="inline-flex rounded-lg border border-[color:var(--border)] overflow-hidden">
                 <button
                   onClick={() => setView("grid")}
-                  className={`px-3 py-1 text-sm ${
-                    view === "grid" ? "bg-[color:var(--surface-2)]" : ""
-                  }`}
+                  className={`px-3 py-1 text-sm ${view === "grid" ? "bg-[color:var(--surface-2)]" : ""}`}
                 >
                   ⊞
                 </button>
@@ -219,10 +264,8 @@ export default function LibraryPage() {
           </div>
 
           {loading ? (
-            <div className="text-[color:var(--muted)] text-sm py-16 text-center">
-              Loading…
-            </div>
-          ) : filtered.length === 0 ? (
+            <div className="text-[color:var(--muted)] text-sm py-16 text-center">Loading…</div>
+          ) : filtered.length === 0 && pending.length === 0 ? (
             <div className="text-center py-20">
               <div className="text-5xl mb-3 opacity-50">📚</div>
               <div className="text-lg font-medium mb-1">No documents yet</div>
@@ -235,12 +278,18 @@ export default function LibraryPage() {
             </div>
           ) : view === "grid" ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+              {pending.map((p) => (
+                <PendingUploadCard key={p.tempId} upload={p} onDismiss={dismissPending} view="grid" />
+              ))}
               {filtered.map((d) => (
                 <DocumentCard key={d.id} doc={d} onDelete={handleDelete} view="grid" />
               ))}
             </div>
           ) : (
             <div className="flex flex-col gap-2">
+              {pending.map((p) => (
+                <PendingUploadCard key={p.tempId} upload={p} onDismiss={dismissPending} view="list" />
+              ))}
               {filtered.map((d) => (
                 <DocumentCard key={d.id} doc={d} onDelete={handleDelete} view="list" />
               ))}
@@ -252,12 +301,7 @@ export default function LibraryPage() {
       <UploadModal
         open={uploadOpen}
         onClose={() => setUploadOpen(false)}
-        onUploaded={(id) => {
-          setUploadOpen(false);
-          loadAll();
-          // Navigate to reader after short delay
-          setTimeout(() => (window.location.href = `/reader/${id}`), 150);
-        }}
+        onSubmit={startUpload}
       />
     </div>
   );
