@@ -1,0 +1,52 @@
+name: Deploy to Oracle Cloud
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          rsync -avz --delete --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            .next/standalone/ \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/apps/reader/
+
+          rsync -avz \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            .next/static/ \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/apps/reader/.next/static/
+
+          if [ -d "public" ]; then
+            rsync -avz \
+              -e "ssh -i ~/.ssh/deploy_key" \
+              public/ \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/apps/reader/public/
+          fi
+
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" && cd /var/www/apps && pm2 restart ecosystem.config.js --only reader --update-env && pm2 save'
