@@ -161,14 +161,7 @@ body {
   flex-direction: column;
   align-items: center;
   padding: 6px;
-  border: 2px solid transparent;
-  border-radius: 6px;
-  transition: border-color 160ms ease, box-shadow 160ms ease;
   scroll-margin-top: 70px;
-}
-.pdf-page-current {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--hglt-sentence);
 }
 .pdf-page-label {
   font-size: 11px;
@@ -180,7 +173,6 @@ body {
   position: relative;
   display: block;
   line-height: 0;
-  isolation: isolate;
 }
 .pdf-page-placeholder {
   background: white;
@@ -193,38 +185,42 @@ body {
   left: 0;
   pointer-events: none;
   overflow: hidden;
-  z-index: 2;
 }
 .pdf-sentence-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 1;
 }
 .pdf-sentence-rect {
   position: absolute;
-  background: var(--hglt-sentence);
+  /* translucent so the PDF text reads through */
+  background: rgba(47, 67, 250, 0.14);
   border-radius: 3px;
   pointer-events: none;
-  mix-blend-mode: multiply;
 }
 .pdf-word-pill {
   position: absolute;
-  background: var(--hglt-word);
-  border: 1px solid rgba(47, 67, 250, 0.35);
+  background: rgba(47, 67, 250, 0.30);
+  border: 1px solid rgba(47, 67, 250, 0.55);
   border-radius: 4px;
   padding: 0;
   pointer-events: none;
   transition: left 80ms ease, top 80ms ease, width 80ms ease;
-  z-index: 2;
   box-sizing: border-box;
-  mix-blend-mode: multiply;
+}
+:root[data-theme="dark"] .pdf-sentence-rect,
+:root:not([data-theme="light"]) .pdf-sentence-rect {
+  background: rgba(131, 147, 255, 0.20);
+}
+:root[data-theme="dark"] .pdf-word-pill,
+:root:not([data-theme="light"]) .pdf-word-pill {
+  background: rgba(131, 147, 255, 0.42);
+  border-color: rgba(131, 147, 255, 0.7);
 }
 .pdf-click-layer {
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 3;
   cursor: text;
   background: transparent;
 }

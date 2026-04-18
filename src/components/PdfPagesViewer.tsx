@@ -184,12 +184,16 @@ export function PdfPagesViewer({
         const r: ItemRange = itemRanges[i];
         const tx = matMul(viewport.transform as number[], item.transform);
         const fontHeight = Math.hypot(tx[2], tx[3]) || 12;
+        // pdfjs's own TextLayer positions text at `tx[5] - 0.8 * fontHeight`
+        // (font ascent ≈ 0.8 of the em box). Using full fontHeight drops
+        // the overlay between lines.
+        const fontAscent = fontHeight * 0.8;
         const widthPx = (item.width ?? 0) * scale;
         return {
           localStart: r.start,
           localEnd: r.end,
           x: tx[4],
-          y: tx[5] - fontHeight,
+          y: tx[5] - fontAscent,
           width: Math.max(widthPx, 2),
           height: fontHeight,
         };
@@ -284,17 +288,12 @@ export function PdfPagesViewer({
           wrap.style.width = `${info.width}px`;
           wrap.dataset.pageIdx = String(i);
 
+          // The stack itself acts as the placeholder (white bg + shadow)
+          // until the canvas is rendered into it.
           const stack = document.createElement("div");
-          stack.className = "pdf-stack";
+          stack.className = "pdf-stack pdf-page-placeholder";
           stack.style.width = `${info.width}px`;
           stack.style.height = `${info.height}px`;
-
-          // Placeholder rect (white, same size as the eventual canvas)
-          const placeholder = document.createElement("div");
-          placeholder.className = "pdf-page-placeholder";
-          placeholder.style.width = `${info.width}px`;
-          placeholder.style.height = `${info.height}px`;
-          stack.appendChild(placeholder);
 
           // Overlay: sentence rects + word pill.
           const overlay = document.createElement("div");
