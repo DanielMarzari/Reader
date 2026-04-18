@@ -20,7 +20,6 @@ export function VoiceLabClient() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [tokenPanelOpen, setTokenPanelOpen] = useState(false);
-  const [uploadOpen, setUploadOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -64,17 +63,12 @@ export function VoiceLabClient() {
               <h1 className="text-lg font-bold">Voice Lab</h1>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button className="btn" onClick={() => setUploadOpen(true)}>
-              + Upload Voice
-            </button>
-            <button
-              className="btn"
-              onClick={() => setTokenPanelOpen((x) => !x)}
-            >
-              {tokenPanelOpen ? "Hide" : "Connect Voice Studio"}
-            </button>
-          </div>
+          <button
+            className="btn"
+            onClick={() => setTokenPanelOpen((x) => !x)}
+          >
+            {tokenPanelOpen ? "Hide" : "Connect Voice Studio"}
+          </button>
         </div>
       </header>
 
@@ -109,15 +103,6 @@ export function VoiceLabClient() {
           />
         )}
       </main>
-
-      <UploadVoiceModal
-        open={uploadOpen}
-        onClose={() => setUploadOpen(false)}
-        onUploaded={() => {
-          setUploadOpen(false);
-          load();
-        }}
-      />
     </div>
   );
 }
@@ -440,157 +425,3 @@ function CoverImage({
   );
 }
 
-// ---- Upload voice modal ----
-
-type UploadProps = {
-  open: boolean;
-  onClose: () => void;
-  onUploaded: () => void;
-};
-
-function UploadVoiceModal({ open, onClose, onUploaded }: UploadProps) {
-  const [name, setName] = useState("");
-  const [audio, setAudio] = useState<File | null>(null);
-  const [cover, setCover] = useState<File | null>(null);
-  const [coverPreview, setCoverPreview] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!open) {
-      setName("");
-      setAudio(null);
-      setCover(null);
-      if (coverPreview) URL.revokeObjectURL(coverPreview);
-      setCoverPreview(null);
-      setError(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  useEffect(() => {
-    if (!cover) {
-      if (coverPreview) URL.revokeObjectURL(coverPreview);
-      setCoverPreview(null);
-      return;
-    }
-    const url = URL.createObjectURL(cover);
-    setCoverPreview(url);
-    return () => URL.revokeObjectURL(url);
-  }, [cover]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (!open) return null;
-
-  async function submit() {
-    if (!name.trim() || !audio || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const fd = new FormData();
-      fd.append("name", name.trim());
-      fd.append("audio", audio);
-      if (cover) fd.append("cover", cover);
-      const r = await fetch("/api/voices", { method: "POST", body: fd });
-      if (!r.ok) {
-        throw new Error(`${r.status}: ${await r.text()}`);
-      }
-      onUploaded();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
-      onClick={onClose}
-      role="dialog"
-      aria-modal="true"
-    >
-      <div
-        className="card w-full max-w-md m-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-base font-semibold">Upload a voice</h2>
-          <button
-            onClick={onClose}
-            className="text-[color:var(--muted)] hover:text-[color:var(--foreground)] text-lg"
-            aria-label="Close"
-          >
-            ×
-          </button>
-        </div>
-
-        <div className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium mb-1">Name</label>
-            <input
-              className="input w-full"
-              placeholder="e.g. Dad, Morgan Freeman, Narrator"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={60}
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium mb-1">Audio file</label>
-            <input
-              type="file"
-              accept="audio/*,.mp3,.wav,.ogg,.m4a"
-              onChange={(e) => setAudio(e.target.files?.[0] ?? null)}
-            />
-            {audio && (
-              <div className="text-xs text-[color:var(--muted)] mt-1">
-                {audio.name} · {(audio.size / 1024).toFixed(0)} KB
-              </div>
-            )}
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium mb-1">
-              Cover image
-              <span className="ml-2 text-[color:var(--muted)] font-normal">
-                optional · replaces the animated sphere
-              </span>
-            </label>
-            <div className="flex items-center gap-3">
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif"
-                onChange={(e) => setCover(e.target.files?.[0] ?? null)}
-              />
-              {coverPreview && (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={coverPreview}
-                  alt="cover preview"
-                  className="w-12 h-12 rounded-full object-cover border border-[color:var(--border)]"
-                />
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-end gap-2 mt-6">
-          {error && (
-            <span className="text-xs text-red-500 flex-1 break-all">{error}</span>
-          )}
-          <button className="btn" onClick={onClose} disabled={busy}>
-            Cancel
-          </button>
-          <button
-            className="btn btn-primary"
-            onClick={submit}
-            disabled={busy || !name.trim() || !audio}
-          >
-            {busy ? "Uploading…" : "Upload"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}

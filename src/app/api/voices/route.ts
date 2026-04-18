@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { randomUUID } from "crypto";
 import path from "path";
 import {
   authorizeVoiceLabRequest,
   listVoiceProfiles,
   upsertVoiceProfile,
 } from "@/lib/voices";
+
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,16 +19,10 @@ export async function GET() {
   return NextResponse.json({ voices });
 }
 
-// POST /api/voices — accepts two flavors of upload:
-//   1. Voice Studio push — bearer token in Authorization header.
-//      Multipart fields: `metadata` (JSON blob), `sample` (MP3).
-//   2. Same-origin user upload from the Voice Lab UI ("Upload Voice" modal).
-//      Multipart fields: `name`, `audio` (MP3/WAV/OGG), optional `cover`
-//      (image). Auth: the request is already from the user's own browser
-//      session on reader.danmarzari.com — we rely on same-origin for now
-//      (AUTH_PASSWORD guards the whole app per ecosystem.config.js).
-//
-// The two shapes are distinguished by the presence of a bearer header.
+// POST /api/voices — Voice Studio push (bearer-authed multipart).
+// Multipart fields: `metadata` (JSON blob), `sample` (audio/mpeg), optional
+// `cover` (image). Same-origin uploads from the Reader UI were removed;
+// the Voice Studio app's Import tab is now the one authoritative path.
 export async function POST(req: NextRequest) {
   const contentType = req.headers.get("content-type") ?? "";
   if (!contentType.includes("multipart/form-data")) {
@@ -36,30 +31,20 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     );
   }
-
-  const form = await req.formData();
-  const hasBearer = Boolean(
-    req.headers.get("authorization") || req.headers.get("Authorization")
-  );
-
-  // ---- Flavor 1: Voice Studio push ----
-  if (hasBearer) {
-    if (!authorizeVoiceLabRequest(req)) {
-      return NextResponse.json(
-        { error: "Unauthorized — generate a token from the Voice Lab UI" },
-        { status: 401 }
-      );
-    }
-    return handleStudioPush(form);
+  if (!authorizeVoiceLabRequest(req)) {
+    return NextResponse.json(
+      { error: "Unauthorized — generate a token from the Voice Lab UI" },
+      { status: 401 }
+    );
   }
-
-  // ---- Flavor 2: user upload from the Voice Lab UI ----
-  return handleUserUpload(form);
+  const form = await req.formData();
+  return handleStudioPush(form);
 }
 
 async function handleStudioPush(form: FormData): Promise<Response> {
   const metaRaw = form.get("metadata");
   const sample = form.get("sample");
+  const cover = form.get("cover");
 
   if (typeof metaRaw !== "string") {
     return NextResponse.json({ error: "Missing 'metadata' field" }, { status: 400 });
@@ -88,9 +73,13 @@ async function handleStudioPush(form: FormData): Promise<Response> {
       { status: 400 }
     );
   }
-  if (meta.kind !== "cloned" && meta.kind !== "designed") {
+  if (
+    meta.kind !== "cloned" &&
+    meta.kind !== "designed" &&
+    meta.kind !== "uploaded"
+  ) {
     return NextResponse.json(
-      { error: "metadata.kind must be 'cloned' or 'designed'" },
+      { error: "metadata.kind must be 'cloned' | 'designed' | 'uploaded'" },
       { status: 400 }
     );
   }
@@ -99,11 +88,35 @@ async function handleStudioPush(form: FormData): Promise<Response> {
   if (!buf.length) {
     return NextResponse.json({ error: "Empty sample file" }, { status: 400 });
   }
-  if (buf.length > 2 * 1024 * 1024) {
+  // Imported voices may be longer than synthesized previews, so the
+  // ceiling is generous; 10 MB is ~6 min of 192 kbps MP3.
+  if (buf.length > 10 * 1024 * 1024) {
     return NextResponse.json(
-      { error: "Sample too large (max 2 MB)" },
+      { error: "Sample too large (max 10 MB)" },
       { status: 413 }
     );
+  }
+
+  // Optional cover image — Voice Studio's Import tab ships one when the
+  // user chooses "profile picture" instead of the mood sphere.
+  let coverBuf: Buffer | null = null;
+  let coverExt: string | null = null;
+  if (cover instanceof File && cover.size > 0) {
+    const ext = path.extname(cover.name || "").toLowerCase();
+    if (!IMAGE_EXTS.has(ext)) {
+      return NextResponse.json(
+        { error: `cover must be one of ${[...IMAGE_EXTS].join(", ")}` },
+        { status: 400 }
+      );
+    }
+    if (cover.size > 5 * 1024 * 1024) {
+      return NextResponse.json(
+        { error: "cover image too large (max 5 MB)" },
+        { status: 413 }
+      );
+    }
+    coverBuf = Buffer.from(await cover.arrayBuffer());
+    coverExt = ext;
   }
 
   try {
@@ -115,6 +128,8 @@ async function handleStudioPush(form: FormData): Promise<Response> {
       createdAt: meta.createdAt ?? new Date().toISOString(),
       design: meta.design ?? {},
       sampleBuffer: buf,
+      coverBuffer: coverBuf,
+      coverExt,
     });
     return NextResponse.json({ voice: saved });
   } catch (err) {
@@ -126,77 +141,3 @@ async function handleStudioPush(form: FormData): Promise<Response> {
   }
 }
 
-// User upload flow — lets the user drop in their own audio file and an
-// optional cover image. The audio is stored as-is as the "sample" (click
-// the sphere / cover to hear it). `kind` is stored as "uploaded".
-const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
-
-async function handleUserUpload(form: FormData): Promise<Response> {
-  const name = (form.get("name") as string | null)?.trim();
-  const audio = form.get("audio");
-  const cover = form.get("cover");
-
-  if (!name) {
-    return NextResponse.json({ error: "name required" }, { status: 400 });
-  }
-  if (!(audio instanceof File)) {
-    return NextResponse.json({ error: "audio file required" }, { status: 400 });
-  }
-
-  const audioBuf = Buffer.from(await audio.arrayBuffer());
-  if (!audioBuf.length) {
-    return NextResponse.json({ error: "empty audio file" }, { status: 400 });
-  }
-  // Cap at 5 MB for user uploads — enough for ~3 min of 192 kbps MP3.
-  if (audioBuf.length > 5 * 1024 * 1024) {
-    return NextResponse.json(
-      { error: "audio too large (max 5 MB)" },
-      { status: 413 }
-    );
-  }
-
-  // Cover is optional. If present, validate it's a small image.
-  let coverBuf: Buffer | null = null;
-  let coverExt: string | null = null;
-  if (cover instanceof File && cover.size > 0) {
-    const origName = cover.name || "";
-    const ext = path.extname(origName).toLowerCase();
-    if (!IMAGE_EXTS.has(ext)) {
-      return NextResponse.json(
-        { error: `cover must be one of ${[...IMAGE_EXTS].join(", ")}` },
-        { status: 400 }
-      );
-    }
-    if (cover.size > 3 * 1024 * 1024) {
-      return NextResponse.json(
-        { error: "cover image too large (max 3 MB)" },
-        { status: 413 }
-      );
-    }
-    coverBuf = Buffer.from(await cover.arrayBuffer());
-    coverExt = ext;
-  }
-
-  const id = randomUUID();
-
-  try {
-    const saved = upsertVoiceProfile({
-      id,
-      name: name.slice(0, 80),
-      kind: "uploaded",
-      engine: "user",
-      createdAt: new Date().toISOString(),
-      design: {},
-      sampleBuffer: audioBuf,
-      coverBuffer: coverBuf,
-      coverExt,
-    });
-    return NextResponse.json({ voice: saved });
-  } catch (err) {
-    console.error("user upload upsert failed:", err);
-    return NextResponse.json(
-      { error: `Failed to save: ${(err as Error).message}` },
-      { status: 500 }
-    );
-  }
-}
