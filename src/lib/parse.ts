@@ -29,6 +29,17 @@ export function countWords(text: string): number {
 export async function parsePdf(buffer: Buffer): Promise<string> {
   // @ts-expect-error legacy build
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // Point pdfjs at the worker file we bundled via outputFileTracingIncludes.
+  // In standalone mode this resolves to node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs
+  // relative to process.cwd().
+  try {
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    const workerPath = req.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc = workerPath;
+  } catch {
+    // Fall back to whatever the default fake-worker resolution gives.
+  }
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buffer),
     useSystemFonts: true,
