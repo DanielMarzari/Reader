@@ -176,6 +176,40 @@ body {
   margin-top: 4px;
   user-select: none;
 }
+.pdf-stack {
+  position: relative;
+  display: block;
+  line-height: 0;
+}
+.pdf-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.pdf-sentence-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+.pdf-sentence-rect {
+  position: absolute;
+  background: var(--hglt-sentence);
+  border-radius: 3px;
+  pointer-events: none;
+}
+.pdf-word-pill {
+  position: absolute;
+  background: var(--hglt-word);
+  border-radius: 4px;
+  padding: 0;
+  pointer-events: none;
+  transition: left 80ms ease, top 80ms ease, width 80ms ease;
+  z-index: 2;
+  box-sizing: border-box;
+  mix-blend-mode: multiply;
+}
 
 /* --- Buttons --- */
 .btn {

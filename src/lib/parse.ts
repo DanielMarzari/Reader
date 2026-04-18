@@ -2,6 +2,7 @@
 // Runs server-side. Returns a single normalized text string.
 
 import JSZip from "jszip";
+import { assemblePage, joinPages, safeNormalize, type PdfItem } from "./pdfAssembly";
 
 export type ParsedDoc = {
   title: string;
@@ -57,47 +58,13 @@ export async function parsePdf(buffer: Buffer): Promise<PdfParseResult> {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    let lastY: number | null = null;
-    let pageText = "";
-    for (const item of content.items as Array<{
-      str: string;
-      transform: number[];
-      hasEOL?: boolean;
-    }>) {
-      const y = item.transform?.[5];
-      if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 2) {
-        pageText += "\n";
-      }
-      pageText += item.str;
-      if (item.hasEOL) pageText += "\n";
-      lastY = y ?? lastY;
-    }
-    pageTexts.push(normalize(pageText));
+    const { text } = assemblePage(content.items as PdfItem[]);
+    pageTexts.push(safeNormalize(text));
   }
   await pdf.destroy();
 
-  // Join normalized pages with a blank line. Record each page's offset
-  // into the combined content string.
-  const SEP = "\n\n";
-  const pageRanges: PdfPageRange[] = [];
-  let cursor = 0;
-  const parts: string[] = [];
-  for (let i = 0; i < pageTexts.length; i++) {
-    const t = pageTexts[i];
-    if (!t) {
-      pageRanges.push({ charStart: cursor, charEnd: cursor });
-      continue;
-    }
-    if (i > 0 && parts.length > 0) {
-      parts.push(SEP);
-      cursor += SEP.length;
-    }
-    const start = cursor;
-    parts.push(t);
-    cursor += t.length;
-    pageRanges.push({ charStart: start, charEnd: cursor });
-  }
-  return { content: parts.join(""), pageRanges };
+  const { content, pageRanges } = joinPages(pageTexts, "\n\n");
+  return { content, pageRanges };
 }
 
 /** Strip HTML/XHTML → plain text, preserving paragraph breaks and headings. */

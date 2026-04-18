@@ -11,6 +11,7 @@ import {
   applyTheme,
   defaultSettings,
   loadSettings,
+  saveSettings,
   type ReaderSettings,
 } from "@/components/SettingsDrawer";
 
@@ -26,8 +27,6 @@ type Props = {
   initialVoiceName: string | null;
 };
 
-type Tab = "text" | "pages";
-
 export function ReaderClient({
   docId,
   title,
@@ -41,15 +40,27 @@ export function ReaderClient({
 }: Props) {
   const [settings, setSettings] = useState<ReaderSettings>(defaultSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [tab, setTab] = useState<Tab>("text");
+  const [hydrated, setHydrated] = useState(false);
+
+  const pagesAvailable = sourceType === "pdf";
 
   useEffect(() => {
     const s = loadSettings();
-    setSettings(s);
-    applyTheme(s.theme);
-  }, []);
+    // If Pages isn't available for this doc, force Text view regardless
+    // of the saved preference (without overwriting localStorage).
+    const resolved: ReaderSettings = {
+      ...s,
+      view: !pagesAvailable ? "text" : s.view,
+    };
+    setSettings(resolved);
+    applyTheme(resolved.theme);
+    setHydrated(true);
+  }, [pagesAvailable]);
 
-  const pagesAvailable = sourceType === "pdf";
+  function onSettingsChange(next: ReaderSettings) {
+    setSettings(next);
+    saveSettings(next);
+  }
 
   return (
     <TTSProvider
@@ -78,30 +89,8 @@ export function ReaderClient({
             </div>
           </div>
 
-          <div className="tab-switch" role="tablist" aria-label="View mode">
-            <button
-              role="tab"
-              aria-selected={tab === "text"}
-              className={tab === "text" ? "active" : ""}
-              onClick={() => setTab("text")}
-            >
-              Text
-            </button>
-            <button
-              role="tab"
-              aria-selected={tab === "pages"}
-              className={tab === "pages" ? "active" : ""}
-              onClick={() => pagesAvailable && setTab("pages")}
-              disabled={!pagesAvailable}
-              title={pagesAvailable ? "" : "Pages view only available for PDFs"}
-              style={pagesAvailable ? undefined : { opacity: 0.5, cursor: "not-allowed" }}
-            >
-              Pages
-            </button>
-          </div>
-
           <button
-            className="btn-ghost ml-1"
+            className="btn-ghost"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -114,14 +103,15 @@ export function ReaderClient({
         </nav>
 
         <main className="reader-canvas flex-1">
-          {tab === "text" ? (
-            <TTSContent highlightSentence={settings.highlightSentence} />
-          ) : (
+          {hydrated && settings.view === "pages" && pagesAvailable ? (
             <PdfPagesViewer
               docId={docId}
               sourceType={sourceType}
               pageRanges={pageRanges}
+              highlightSentence={settings.highlightSentence}
             />
+          ) : (
+            <TTSContent highlightSentence={settings.highlightSentence} />
           )}
         </main>
 
@@ -131,10 +121,10 @@ export function ReaderClient({
           open={settingsOpen}
           onClose={() => setSettingsOpen(false)}
           settings={settings}
-          onChange={setSettings}
+          onChange={onSettingsChange}
+          pagesAvailable={pagesAvailable}
         />
 
-        {/* Suppress unused-variable lint for wordCount if any linter runs */}
         <span className="sr-only">{wordCount}</span>
       </div>
     </TTSProvider>

@@ -8,9 +8,11 @@ import {
 } from "@/lib/autoskip";
 
 type Theme = "system" | "light" | "dark";
+export type View = "text" | "pages";
 
 export type ReaderSettings = {
   theme: Theme;
+  view: View;
   highlightSentence: boolean;
   clickToListen: boolean;
   autoSkip: AutoSkipSettings;
@@ -18,6 +20,7 @@ export type ReaderSettings = {
 
 export const defaultSettings: ReaderSettings = {
   theme: "system",
+  view: "text",
   highlightSentence: true,
   clickToListen: false,
   autoSkip: defaultAutoSkip,
@@ -75,11 +78,13 @@ export function SettingsDrawer({
   onClose,
   settings,
   onChange,
+  pagesAvailable,
 }: {
   open: boolean;
   onClose: () => void;
   settings: ReaderSettings;
   onChange: (next: ReaderSettings) => void;
+  pagesAvailable: boolean;
 }) {
   const [panel, setPanel] = useState<"main" | "autoskip">("main");
 
@@ -120,6 +125,32 @@ export function SettingsDrawer({
 
         {panel === "main" ? (
           <div className="p-5 space-y-6 overflow-y-auto">
+            <section className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-sm font-medium">View</div>
+                <div className="text-xs text-[color:var(--muted)]">
+                  Switch between extracted text and original PDF pages.
+                </div>
+              </div>
+              <div className="seg">
+                {(["text", "pages"] as View[]).map((v) => {
+                  const disabled = v === "pages" && !pagesAvailable;
+                  return (
+                    <button
+                      key={v}
+                      className={settings.view === v ? "active" : ""}
+                      onClick={() => !disabled && update({ view: v })}
+                      disabled={disabled}
+                      title={disabled ? "Pages view is only available for PDFs" : ""}
+                      style={disabled ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
+                    >
+                      {v === "text" ? "Text" : "Pages"}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
             <section className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-sm font-medium">App Theme</div>
