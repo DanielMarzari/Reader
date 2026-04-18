@@ -75,13 +75,19 @@ function ensureAllTables(db: Database.Database) {
     CREATE TABLE IF NOT EXISTS voice_profiles (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('cloned','designed')),
+      kind TEXT NOT NULL CHECK (kind IN ('cloned','designed','uploaded')),
       engine TEXT NOT NULL,
       meta_json TEXT NOT NULL DEFAULT '{}',
       sample_path TEXT,
+      cover_path TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  // Additive migration: older DBs might be missing cover_path.
+  const vCols = db.prepare(`PRAGMA table_info(voice_profiles)`).all() as Array<{ name: string }>;
+  if (!vCols.some((c) => c.name === "cover_path")) {
+    db.exec(`ALTER TABLE voice_profiles ADD COLUMN cover_path TEXT`);
+  }
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_voice_profiles_created ON voice_profiles(created_at DESC)`
   );
@@ -127,10 +133,11 @@ export type CollectionRow = {
 export type VoiceProfileRow = {
   id: string;
   name: string;
-  kind: "cloned" | "designed";
+  kind: "cloned" | "designed" | "uploaded";
   engine: string;
   meta_json: string;
   sample_path: string | null;
+  cover_path: string | null;
   created_at: string;
 };
 

@@ -7,11 +7,12 @@ import { VoiceSphere } from "@/components/VoiceSphere";
 type VoiceProfile = {
   id: string;
   name: string;
-  kind: "cloned" | "designed";
+  kind: "cloned" | "designed" | "uploaded";
   engine: string;
   createdAt: string;
-  design: Record<string, unknown>;
+  design: Record<string, unknown> & { colors?: string[] | null };
   hasSample: boolean;
+  coverUrl: string | null;
 };
 
 export function VoiceLabClient() {
@@ -19,6 +20,7 @@ export function VoiceLabClient() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [tokenPanelOpen, setTokenPanelOpen] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -62,12 +64,17 @@ export function VoiceLabClient() {
               <h1 className="text-lg font-bold">Voice Lab</h1>
             </div>
           </div>
-          <button
-            className="btn"
-            onClick={() => setTokenPanelOpen((x) => !x)}
-          >
-            {tokenPanelOpen ? "Hide" : "Connect Voice Studio"}
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn" onClick={() => setUploadOpen(true)}>
+              + Upload Voice
+            </button>
+            <button
+              className="btn"
+              onClick={() => setTokenPanelOpen((x) => !x)}
+            >
+              {tokenPanelOpen ? "Hide" : "Connect Voice Studio"}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -102,6 +109,15 @@ export function VoiceLabClient() {
           />
         )}
       </main>
+
+      <UploadVoiceModal
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        onUploaded={() => {
+          setUploadOpen(false);
+          load();
+        }}
+      />
     </div>
   );
 }
@@ -145,21 +161,41 @@ function VoiceCard({
 }) {
   const subtitle = useMemo(() => {
     if (voice.kind === "cloned") return "Cloned voice";
+    if (voice.kind === "uploaded") return "Uploaded";
     const d = voice.design as { base_voice?: string };
     return d.base_voice ? `Designed · ${d.base_voice}` : "Designed voice";
   }, [voice]);
 
+  // If the voice has a user-provided cover image, show THAT instead of the
+  // dynamic sphere. Otherwise render the sphere, using the exact palette
+  // saved from Voice Studio when available (falls back to seed-derived).
+  const sphereColors = Array.isArray(voice.design.colors) && voice.design.colors.length === 4
+    ? (voice.design.colors as [string, string, string, string])
+    : undefined;
+
   return (
     <div className="group flex flex-col items-center text-center">
       <div className="relative">
-        <VoiceSphere
-          seed={voice.id}
-          size={160}
-          speaking={playing}
-          withPlayIcon={!playing}
-          onClick={voice.hasSample ? onPlay : undefined}
-          ariaLabel={`Play ${voice.name}`}
-        />
+        {voice.coverUrl ? (
+          <CoverImage
+            url={voice.coverUrl}
+            alt={voice.name}
+            size={160}
+            playing={playing}
+            hasSample={voice.hasSample}
+            onClick={voice.hasSample ? onPlay : undefined}
+          />
+        ) : (
+          <VoiceSphere
+            seed={voice.id}
+            size={160}
+            speaking={playing}
+            withPlayIcon={!playing}
+            colors={sphereColors}
+            onClick={voice.hasSample ? onPlay : undefined}
+            ariaLabel={`Play ${voice.name}`}
+          />
+        )}
       </div>
       <div className="mt-4">
         <div className="font-medium">{voice.name}</div>
@@ -347,6 +383,214 @@ function TokenPanel() {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---- Cover image (replaces the sphere when the voice has one) ----
+
+function CoverImage({
+  url,
+  alt,
+  size,
+  playing,
+  hasSample,
+  onClick,
+}: {
+  url: string;
+  alt: string;
+  size: number;
+  playing: boolean;
+  hasSample: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <div
+      className={`voice-cover ${playing ? "voice-cover--playing" : ""} ${
+        hasSample ? "voice-cover--clickable" : ""
+      }`}
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={(e) => {
+        if (onClick && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+      style={{ width: size, height: size }}
+      aria-label={`Play ${alt}`}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={url} alt={alt} draggable={false} />
+      {!playing && hasSample && (
+        <div className="voice-sphere-play" aria-hidden>
+          <svg
+            width="38%"
+            height="38%"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden
+          >
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Upload voice modal ----
+
+type UploadProps = {
+  open: boolean;
+  onClose: () => void;
+  onUploaded: () => void;
+};
+
+function UploadVoiceModal({ open, onClose, onUploaded }: UploadProps) {
+  const [name, setName] = useState("");
+  const [audio, setAudio] = useState<File | null>(null);
+  const [cover, setCover] = useState<File | null>(null);
+  const [coverPreview, setCoverPreview] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setName("");
+      setAudio(null);
+      setCover(null);
+      if (coverPreview) URL.revokeObjectURL(coverPreview);
+      setCoverPreview(null);
+      setError(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!cover) {
+      if (coverPreview) URL.revokeObjectURL(coverPreview);
+      setCoverPreview(null);
+      return;
+    }
+    const url = URL.createObjectURL(cover);
+    setCoverPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [cover]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!open) return null;
+
+  async function submit() {
+    if (!name.trim() || !audio || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append("name", name.trim());
+      fd.append("audio", audio);
+      if (cover) fd.append("cover", cover);
+      const r = await fetch("/api/voices", { method: "POST", body: fd });
+      if (!r.ok) {
+        throw new Error(`${r.status}: ${await r.text()}`);
+      }
+      onUploaded();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div
+        className="card w-full max-w-md m-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-base font-semibold">Upload a voice</h2>
+          <button
+            onClick={onClose}
+            className="text-[color:var(--muted)] hover:text-[color:var(--foreground)] text-lg"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium mb-1">Name</label>
+            <input
+              className="input w-full"
+              placeholder="e.g. Dad, Morgan Freeman, Narrator"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={60}
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium mb-1">Audio file</label>
+            <input
+              type="file"
+              accept="audio/*,.mp3,.wav,.ogg,.m4a"
+              onChange={(e) => setAudio(e.target.files?.[0] ?? null)}
+            />
+            {audio && (
+              <div className="text-xs text-[color:var(--muted)] mt-1">
+                {audio.name} · {(audio.size / 1024).toFixed(0)} KB
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium mb-1">
+              Cover image
+              <span className="ml-2 text-[color:var(--muted)] font-normal">
+                optional · replaces the animated sphere
+              </span>
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                onChange={(e) => setCover(e.target.files?.[0] ?? null)}
+              />
+              {coverPreview && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={coverPreview}
+                  alt="cover preview"
+                  className="w-12 h-12 rounded-full object-cover border border-[color:var(--border)]"
+                />
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 mt-6">
+          {error && (
+            <span className="text-xs text-red-500 flex-1 break-all">{error}</span>
+          )}
+          <button className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={submit}
+            disabled={busy || !name.trim() || !audio}
+          >
+            {busy ? "Uploading…" : "Upload"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

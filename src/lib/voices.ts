@@ -18,16 +18,21 @@ export function voiceSamplePath(id: string): string {
   return path.join(voiceSampleDir(id), "sample.mp3");
 }
 
+export function voiceCoverPath(id: string, ext: string): string {
+  return path.join(voiceSampleDir(id), `cover${ext}`);
+}
+
 // ---- Voice profile CRUD ----
 
 export type VoiceProfile = {
   id: string;
   name: string;
-  kind: "cloned" | "designed";
+  kind: "cloned" | "designed" | "uploaded";
   engine: string;
   createdAt: string;
   design: Record<string, unknown>;
   hasSample: boolean;
+  coverUrl: string | null;
 };
 
 function rowTo(p: VoiceProfileRow): VoiceProfile {
@@ -37,6 +42,7 @@ function rowTo(p: VoiceProfileRow): VoiceProfile {
   } catch {
     // Corrupt JSON in storage — surface as empty, don't crash the page.
   }
+  const hasCover = Boolean(p.cover_path && fs.existsSync(p.cover_path));
   return {
     id: p.id,
     name: p.name,
@@ -45,6 +51,7 @@ function rowTo(p: VoiceProfileRow): VoiceProfile {
     createdAt: p.created_at,
     design,
     hasSample: Boolean(p.sample_path && fs.existsSync(p.sample_path)),
+    coverUrl: hasCover ? `/api/voices/${p.id}/cover` : null,
   };
 }
 
@@ -67,29 +74,40 @@ export function getVoiceProfile(id: string): VoiceProfile | null {
 export function upsertVoiceProfile(args: {
   id: string;
   name: string;
-  kind: "cloned" | "designed";
+  kind: "cloned" | "designed" | "uploaded";
   engine: string;
   createdAt: string;
   design: Record<string, unknown>;
   sampleBuffer: Buffer;
+  /** Optional cover image — when present, displayed instead of the sphere. */
+  coverBuffer?: Buffer | null;
+  /** Extension for the cover file (e.g. ".png", ".jpg"). */
+  coverExt?: string | null;
 }): VoiceProfile {
   const db = getDb();
 
-  // Write the sample first. If anything fails, we haven't polluted the DB.
+  // Write files first. If anything fails, we haven't polluted the DB.
   const dir = voiceSampleDir(args.id);
   fs.mkdirSync(dir, { recursive: true });
   const samplePath = path.join(dir, "sample.mp3");
   fs.writeFileSync(samplePath, args.sampleBuffer);
 
+  let coverPath: string | null = null;
+  if (args.coverBuffer && args.coverExt) {
+    coverPath = voiceCoverPath(args.id, args.coverExt);
+    fs.writeFileSync(coverPath, args.coverBuffer);
+  }
+
   db.prepare(
-    `INSERT INTO voice_profiles (id, name, kind, engine, meta_json, sample_path, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO voice_profiles (id, name, kind, engine, meta_json, sample_path, cover_path, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        name=excluded.name,
        kind=excluded.kind,
        engine=excluded.engine,
        meta_json=excluded.meta_json,
-       sample_path=excluded.sample_path`
+       sample_path=excluded.sample_path,
+       cover_path=COALESCE(excluded.cover_path, voice_profiles.cover_path)`
   ).run(
     args.id,
     args.name,
@@ -97,6 +115,7 @@ export function upsertVoiceProfile(args: {
     args.engine,
     JSON.stringify(args.design ?? {}),
     samplePath,
+    coverPath,
     args.createdAt
   );
 
@@ -108,21 +127,19 @@ export function upsertVoiceProfile(args: {
 export function deleteVoiceProfile(id: string): boolean {
   const db = getDb();
   const row = db
-    .prepare(`SELECT sample_path FROM voice_profiles WHERE id = ?`)
-    .get(id) as { sample_path: string | null } | undefined;
+    .prepare(`SELECT sample_path, cover_path FROM voice_profiles WHERE id = ?`)
+    .get(id) as { sample_path: string | null; cover_path: string | null } | undefined;
   if (!row) return false;
 
   db.prepare(`DELETE FROM voice_profiles WHERE id = ?`).run(id);
 
   // Best-effort cleanup of files on disk. Don't throw if they're gone.
   try {
-    if (row.sample_path && fs.existsSync(row.sample_path)) {
-      fs.unlinkSync(row.sample_path);
+    for (const p of [row.sample_path, row.cover_path]) {
+      if (p && fs.existsSync(p)) fs.unlinkSync(p);
     }
     const dir = voiceSampleDir(id);
     if (fs.existsSync(dir)) {
-      // Remove only if empty — safer than rmSync(recursive) in case user
-      // stores something else here later.
       try {
         fs.rmdirSync(dir);
       } catch {
