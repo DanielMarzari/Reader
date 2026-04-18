@@ -490,18 +490,42 @@ export function PdfPagesViewer({
         }
         const overlay = sentenceOverlayRefs.current[idx];
         if (overlay) {
+          const addRect = (x: number, y: number, w: number, h: number) => {
+            if (w <= 1 || h <= 1) return;
+            const rect = document.createElement("div");
+            rect.className = "pdf-sentence-rect";
+            rect.style.left = `${x}px`;
+            rect.style.top = `${y}px`;
+            rect.style.width = `${w}px`;
+            rect.style.height = `${h}px`;
+            overlay.appendChild(rect);
+          };
+
           for (const row of rows) {
             const xMin = Math.min(...row.map((it) => it.x));
             const xMax = Math.max(...row.map((it) => it.x + it.width));
             const yMin = Math.min(...row.map((it) => it.y));
             const yMax = Math.max(...row.map((it) => it.y + it.height));
-            const rect = document.createElement("div");
-            rect.className = "pdf-sentence-rect";
-            rect.style.left = `${xMin - 2}px`;
-            rect.style.top = `${yMin - 1}px`;
-            rect.style.width = `${xMax - xMin + 4}px`;
-            rect.style.height = `${yMax - yMin + 2}px`;
-            overlay.appendChild(rect);
+            const rowH = yMax - yMin + 2;
+            const rowY = yMin - 1;
+
+            // If the current word pill lives in this row, split the
+            // sentence rect around it so the two overlays don't stack
+            // (stacked translucent rects darken the word too much).
+            const pillInRow =
+              item &&
+              Math.abs(item.y - yMin) <= tol &&
+              item.x + item.width > xMin &&
+              item.x < xMax;
+
+            if (pillInRow && item) {
+              const leftEnd = Math.max(xMin - 2, item.x);
+              const rightStart = Math.min(xMax + 2, item.x + item.width);
+              addRect(xMin - 2, rowY, leftEnd - (xMin - 2), rowH);
+              addRect(rightStart, rowY, (xMax + 2) - rightStart, rowH);
+            } else {
+              addRect(xMin - 2, rowY, xMax - xMin + 4, rowH);
+            }
           }
         }
       }
