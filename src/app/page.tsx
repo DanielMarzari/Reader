@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import type { DocumentSummary, Collection } from "@/types/document";
 import { UploadModal, type UploadRequest } from "@/components/UploadModal";
@@ -152,6 +153,13 @@ export default function LibraryPage() {
 
       <div className="max-w-[1400px] mx-auto flex">
         <aside className="w-60 shrink-0 border-r border-[color:var(--border)] p-4 hidden md:block">
+          <Link
+            href="/voice-lab"
+            className="w-full flex items-center gap-2 rounded-md px-3 py-2 text-sm mb-4 hover:bg-[color:var(--surface)] border border-[color:var(--border)]"
+          >
+            <span className="voice-lab-dot" aria-hidden />
+            Voice Lab
+          </Link>
           <div className="text-xs uppercase tracking-wider text-[color:var(--muted)] mb-2">
             Library
           </div>
