@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 import { insertDocument, listDocuments } from "@/lib/documents";
 import { countWords, parseEpub, parsePdf, parseText, normalize } from "@/lib/parse";
+import { saveOriginal } from "@/lib/files";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,6 +19,7 @@ export async function POST(req: NextRequest) {
   let sourceType: "pdf" | "epub" | "text" = "text";
   let originalFilename: string | null = null;
   let content = "";
+  let originalBuffer: Buffer | null = null;
 
   if (contentType.includes("multipart/form-data")) {
     const form = await req.formData();
@@ -29,6 +31,7 @@ export async function POST(req: NextRequest) {
     const buffer = Buffer.from(await file.arrayBuffer());
     originalFilename = file.name;
     const lower = file.name.toLowerCase();
+    originalBuffer = buffer;
 
     try {
       if (lower.endsWith(".pdf") || file.type === "application/pdf") {
@@ -80,6 +83,18 @@ export async function POST(req: NextRequest) {
   }
 
   const id = randomUUID();
+
+  // Persist original PDF/EPUB so the Pages tab can render it. Text files
+  // don't need the original — we already have the full content.
+  let storedPath: string | null = null;
+  if (originalBuffer && (sourceType === "pdf" || sourceType === "epub")) {
+    try {
+      storedPath = await saveOriginal(id, sourceType, originalBuffer);
+    } catch (err) {
+      console.warn("Failed to save original upload:", (err as Error).message);
+    }
+  }
+
   insertDocument({
     id,
     title: title.slice(0, 250),
@@ -87,6 +102,7 @@ export async function POST(req: NextRequest) {
     originalFilename,
     content,
     wordCount: countWords(content),
+    storedPath,
   });
 
   return NextResponse.json({ id });

@@ -1,70 +1,96 @@
-// Tokenize a block of text into paragraphs → words for rendering and highlighting.
-// Preserves character offsets so we can map from `onboundary` charIndex → word.
+// Tokenize a block of text into paragraphs → sentences → words for
+// rendering and two-tier highlighting. Preserves character offsets so
+// we can map from `onboundary` charIndex → word → enclosing sentence.
 
 export type Word = {
   text: string;
   start: number; // char offset in full content
   end: number; // exclusive
-  // whitespace/punctuation following this word (part of display, not spoken focus)
-  trailing: string;
+  trailing: string; // whitespace/punctuation that follows
+  sentenceIndex: number; // index into the global sentence list
+};
+
+export type Sentence = {
+  start: number;
+  end: number;
 };
 
 export type Paragraph = {
-  text: string; // the whole paragraph as one string (easier for utterances)
-  start: number; // char offset of paragraph start in full content
-  end: number; // exclusive
+  text: string;
+  start: number;
+  end: number;
   words: Word[];
 };
 
-/** Split content into paragraphs, then each paragraph into words with offsets. */
-export function tokenize(content: string): Paragraph[] {
+export type Tokenized = {
+  paragraphs: Paragraph[];
+  words: Word[];
+  sentences: Sentence[];
+};
+
+/** Split content into paragraphs → sentences → words, all with char offsets. */
+export function tokenize(content: string): Tokenized {
   const paragraphs: Paragraph[] = [];
-  // Split by double newline; keep their offsets.
-  const re = /[^\n]+(?:\n[^\n]+)*/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const paraText = m[0];
-    const paraStart = m.index;
+  const words: Word[] = [];
+  const sentences: Sentence[] = [];
+
+  const paraRe = /[^\n]+(?:\n[^\n]+)*/g;
+  let pm: RegExpExecArray | null;
+
+  while ((pm = paraRe.exec(content)) !== null) {
+    const paraText = pm[0];
+    const paraStart = pm.index;
     const paraEnd = paraStart + paraText.length;
 
-    const words: Word[] = [];
-    // Match words and trailing whitespace/punctuation separately.
+    // Sentence segmentation inside this paragraph.
+    const sentenceRe = /[^.!?]+[.!?]+["')\]”’]*\s*|[^.!?]+$/g;
+    const paraSentences: Sentence[] = [];
+    let sm: RegExpExecArray | null;
+    while ((sm = sentenceRe.exec(paraText)) !== null) {
+      const sStart = paraStart + sm.index;
+      const sEnd = sStart + sm[0].length;
+      paraSentences.push({ start: sStart, end: sEnd });
+    }
+    if (paraSentences.length === 0) {
+      paraSentences.push({ start: paraStart, end: paraEnd });
+    }
+
+    const paraWords: Word[] = [];
     const wordRe = /([\p{L}\p{N}][\p{L}\p{N}'’-]*)(\s*[.,;:!?—\-…"()\[\]“”‘’]*\s*)?/gu;
     let wm: RegExpExecArray | null;
     while ((wm = wordRe.exec(paraText)) !== null) {
       if (!wm[1]) continue;
       const wStart = paraStart + wm.index;
       const wEnd = wStart + wm[1].length;
-      words.push({
+
+      // Find enclosing sentence (global index).
+      const localIdx = paraSentences.findIndex(
+        (s) => wStart >= s.start && wStart < s.end
+      );
+      const sentenceIndex =
+        sentences.length +
+        (localIdx === -1 ? paraSentences.length - 1 : localIdx);
+
+      const word: Word = {
         text: wm[1],
         start: wStart,
         end: wEnd,
         trailing: wm[2] ?? "",
-      });
+        sentenceIndex,
+      };
+      paraWords.push(word);
+      words.push(word);
     }
-    paragraphs.push({ text: paraText, start: paraStart, end: paraEnd, words });
+
+    sentences.push(...paraSentences);
+    paragraphs.push({ text: paraText, start: paraStart, end: paraEnd, words: paraWords });
   }
-  return paragraphs;
+
+  return { paragraphs, words, sentences };
 }
 
-/** Flatten to a single ordered word list (for index-based navigation). */
-export function flatWords(paragraphs: Paragraph[]): Word[] {
-  const out: Word[] = [];
-  for (const p of paragraphs) out.push(...p.words);
-  return out;
-}
-
-/** Find the paragraph index containing this char offset (or the first paragraph after). */
-export function paragraphIndexAt(paragraphs: Paragraph[], charIndex: number): number {
-  for (let i = 0; i < paragraphs.length; i++) {
-    if (charIndex < paragraphs[i].end) return i;
-  }
-  return Math.max(0, paragraphs.length - 1);
-}
-
-/** Find the word index containing this char offset (global, across all paragraphs). */
+/** Binary-search the word index at a given char offset. */
 export function wordIndexAt(words: Word[], charIndex: number): number {
-  // Binary search
   let lo = 0;
   let hi = words.length - 1;
   while (lo <= hi) {
@@ -74,6 +100,5 @@ export function wordIndexAt(words: Word[], charIndex: number): number {
     else if (charIndex >= w.end) lo = mid + 1;
     else return mid;
   }
-  // If in a gap, return the next word.
   return Math.min(words.length - 1, Math.max(0, lo));
 }

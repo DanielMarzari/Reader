@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   deleteDocument,
   getDocument,
+  getStoredPath,
   setDocumentCollections,
   updateDocumentTitle,
 } from "@/lib/documents";
+import { deleteOriginal } from "@/lib/files";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -42,6 +44,8 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const storedPath = getStoredPath(id);
   deleteDocument(id);
+  await deleteOriginal(storedPath);
   return NextResponse.json({ ok: true });
 }

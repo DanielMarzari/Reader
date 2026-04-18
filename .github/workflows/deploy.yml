@@ -31,7 +31,9 @@ jobs:
 
       - name: Deploy
         run: |
-          rsync -avz --delete --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+          rsync -avz --delete \
+            --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+            --exclude='files/' \
             -e "ssh -i ~/.ssh/deploy_key" \
             .next/standalone/ \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/apps/reader/

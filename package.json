@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "npm run copy-pdf-worker && next dev",
+    "build": "npm run copy-pdf-worker && next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "copy-pdf-worker": "node -e \"const fs=require('fs');const p=require.resolve('pdfjs-dist/build/pdf.worker.mjs');fs.mkdirSync('public',{recursive:true});fs.copyFileSync(p,'public/pdf.worker.mjs');console.log('copied pdfjs worker →','public/pdf.worker.mjs');\""
   },
   "dependencies": {
     "better-sqlite3": "^12.8.0",

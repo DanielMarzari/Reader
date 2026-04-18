@@ -93,12 +93,25 @@ export function insertDocument(doc: {
   originalFilename: string | null;
   content: string;
   wordCount: number;
+  storedPath?: string | null;
 }) {
   const db = getDb();
   db.prepare(
-    `INSERT INTO documents (id, title, source_type, original_filename, content, word_count, char_count)
-     VALUES (@id, @title, @sourceType, @originalFilename, @content, @wordCount, @charCount)`
-  ).run({ ...doc, charCount: doc.content.length });
+    `INSERT INTO documents (id, title, source_type, original_filename, content, word_count, char_count, stored_path)
+     VALUES (@id, @title, @sourceType, @originalFilename, @content, @wordCount, @charCount, @storedPath)`
+  ).run({
+    ...doc,
+    charCount: doc.content.length,
+    storedPath: doc.storedPath ?? null,
+  });
+}
+
+export function getStoredPath(id: string): string | null {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT stored_path FROM documents WHERE id = ?`)
+    .get(id) as { stored_path: string | null } | undefined;
+  return row?.stored_path ?? null;
 }
 
 export function deleteDocument(id: string) {
