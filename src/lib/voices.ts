@@ -1,0 +1,214 @@
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { getDb, type VoiceProfileRow } from "./db";
+
+// Storage root — one directory per app. Defaults to ./storage next to the
+// DB if STORAGE_DIR is not set (useful for local dev). In production we set
+// STORAGE_DIR=/var/www/apps/reader/storage in the PM2 ecosystem config.
+function storageRoot(): string {
+  return process.env.STORAGE_DIR || path.join(process.cwd(), "storage");
+}
+
+export function voiceSampleDir(id: string): string {
+  return path.join(storageRoot(), "voices", id);
+}
+
+export function voiceSamplePath(id: string): string {
+  return path.join(voiceSampleDir(id), "sample.mp3");
+}
+
+// ---- Voice profile CRUD ----
+
+export type VoiceProfile = {
+  id: string;
+  name: string;
+  kind: "cloned" | "designed";
+  engine: string;
+  createdAt: string;
+  design: Record<string, unknown>;
+  hasSample: boolean;
+};
+
+function rowTo(p: VoiceProfileRow): VoiceProfile {
+  let design: Record<string, unknown> = {};
+  try {
+    design = JSON.parse(p.meta_json) as Record<string, unknown>;
+  } catch {
+    // Corrupt JSON in storage — surface as empty, don't crash the page.
+  }
+  return {
+    id: p.id,
+    name: p.name,
+    kind: p.kind,
+    engine: p.engine,
+    createdAt: p.created_at,
+    design,
+    hasSample: Boolean(p.sample_path && fs.existsSync(p.sample_path)),
+  };
+}
+
+export function listVoiceProfiles(): VoiceProfile[] {
+  const db = getDb();
+  const rows = db
+    .prepare(`SELECT * FROM voice_profiles ORDER BY created_at DESC`)
+    .all() as VoiceProfileRow[];
+  return rows.map(rowTo);
+}
+
+export function getVoiceProfile(id: string): VoiceProfile | null {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT * FROM voice_profiles WHERE id = ?`)
+    .get(id) as VoiceProfileRow | undefined;
+  return row ? rowTo(row) : null;
+}
+
+export function upsertVoiceProfile(args: {
+  id: string;
+  name: string;
+  kind: "cloned" | "designed";
+  engine: string;
+  createdAt: string;
+  design: Record<string, unknown>;
+  sampleBuffer: Buffer;
+}): VoiceProfile {
+  const db = getDb();
+
+  // Write the sample first. If anything fails, we haven't polluted the DB.
+  const dir = voiceSampleDir(args.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const samplePath = path.join(dir, "sample.mp3");
+  fs.writeFileSync(samplePath, args.sampleBuffer);
+
+  db.prepare(
+    `INSERT INTO voice_profiles (id, name, kind, engine, meta_json, sample_path, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name=excluded.name,
+       kind=excluded.kind,
+       engine=excluded.engine,
+       meta_json=excluded.meta_json,
+       sample_path=excluded.sample_path`
+  ).run(
+    args.id,
+    args.name,
+    args.kind,
+    args.engine,
+    JSON.stringify(args.design ?? {}),
+    samplePath,
+    args.createdAt
+  );
+
+  const row = getVoiceProfile(args.id);
+  if (!row) throw new Error("insert failed");
+  return row;
+}
+
+export function deleteVoiceProfile(id: string): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT sample_path FROM voice_profiles WHERE id = ?`)
+    .get(id) as { sample_path: string | null } | undefined;
+  if (!row) return false;
+
+  db.prepare(`DELETE FROM voice_profiles WHERE id = ?`).run(id);
+
+  // Best-effort cleanup of files on disk. Don't throw if they're gone.
+  try {
+    if (row.sample_path && fs.existsSync(row.sample_path)) {
+      fs.unlinkSync(row.sample_path);
+    }
+    const dir = voiceSampleDir(id);
+    if (fs.existsSync(dir)) {
+      // Remove only if empty — safer than rmSync(recursive) in case user
+      // stores something else here later.
+      try {
+        fs.rmdirSync(dir);
+      } catch {
+        /* not empty */
+      }
+    }
+  } catch {
+    /* swallow — DB row is gone, that's the source of truth */
+  }
+  return true;
+}
+
+// ---- Voice Lab tokens (bearer auth for Voice Studio → Reader) ----
+
+export type VoiceLabToken = {
+  label: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+
+function hashToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+export function createVoiceLabToken(label?: string): {
+  token: string;
+  record: VoiceLabToken;
+} {
+  // Generate 32 bytes of entropy — plenty for a bearer token.
+  const token = crypto.randomBytes(32).toString("base64url");
+  const hash = hashToken(token);
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `INSERT INTO voice_lab_tokens (token_hash, label, created_at)
+       VALUES (?, ?, ?)`
+    )
+    .run(hash, label ?? null, now);
+  return {
+    token,
+    record: { label: label ?? null, createdAt: now, lastUsedAt: null },
+  };
+}
+
+export function validateVoiceLabToken(token: string): boolean {
+  if (!token) return false;
+  const hash = hashToken(token);
+  const row = getDb()
+    .prepare(`SELECT token_hash FROM voice_lab_tokens WHERE token_hash = ?`)
+    .get(hash) as { token_hash: string } | undefined;
+  if (!row) return false;
+  // Best-effort bump of last_used_at; failure here shouldn't reject auth.
+  try {
+    getDb()
+      .prepare(`UPDATE voice_lab_tokens SET last_used_at = ? WHERE token_hash = ?`)
+      .run(new Date().toISOString(), hash);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+export function listVoiceLabTokens(): VoiceLabToken[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT label, created_at, last_used_at FROM voice_lab_tokens ORDER BY created_at DESC`
+    )
+    .all() as Array<{ label: string | null; created_at: string; last_used_at: string | null }>;
+  return rows.map((r) => ({
+    label: r.label,
+    createdAt: r.created_at,
+    lastUsedAt: r.last_used_at,
+  }));
+}
+
+export function revokeAllVoiceLabTokens(): number {
+  const info = getDb().prepare(`DELETE FROM voice_lab_tokens`).run();
+  return info.changes;
+}
+
+// ---- Bearer-token auth helper for API routes ----
+
+export function authorizeVoiceLabRequest(req: Request): boolean {
+  const header = req.headers.get("authorization") || req.headers.get("Authorization");
+  if (!header) return false;
+  const m = /^Bearer\s+(.+)$/.exec(header.trim());
+  if (!m) return false;
+  return validateVoiceLabToken(m[1].trim());
+}

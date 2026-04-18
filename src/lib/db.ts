@@ -66,6 +66,34 @@ function ensureAllTables(db: Database.Database) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(updated_at DESC)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_coll_doc ON document_collections(document_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_coll_coll ON document_collections(collection_id)`);
+
+  // Voice Lab — profiles uploaded from the Voice Studio local tool, plus
+  // bearer tokens that authenticate those uploads. sample_path is an
+  // absolute path under STORAGE_DIR (outside /public so requests are
+  // mediated by the API route).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS voice_profiles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('cloned','designed')),
+      engine TEXT NOT NULL,
+      meta_json TEXT NOT NULL DEFAULT '{}',
+      sample_path TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_voice_profiles_created ON voice_profiles(created_at DESC)`
+  );
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS voice_lab_tokens (
+      token_hash TEXT PRIMARY KEY,
+      label TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TEXT
+    )
+  `);
 }
 
 export type DocumentRow = {
@@ -94,4 +122,21 @@ export type CollectionRow = {
   id: string;
   name: string;
   created_at: string;
+};
+
+export type VoiceProfileRow = {
+  id: string;
+  name: string;
+  kind: "cloned" | "designed";
+  engine: string;
+  meta_json: string;
+  sample_path: string | null;
+  created_at: string;
+};
+
+export type VoiceLabTokenRow = {
+  token_hash: string;
+  label: string | null;
+  created_at: string;
+  last_used_at: string | null;
 };
