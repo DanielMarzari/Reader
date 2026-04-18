@@ -33,10 +33,13 @@ type TTSContextValue = {
   totalSec: number;
   progressPct: number;
 
+  clickToListen: boolean;
+
   play: () => void;
   pause: () => void;
   skip: (seconds: number) => void;
   seekTo: (wordIdx: number, play?: boolean) => void;
+  seekToCharOffset: (charOffset: number, play?: boolean) => void;
   seekFrac: (frac: number) => void;
   cycleRate: () => void;
   setVoice: (name: string) => void;
@@ -230,10 +233,21 @@ export function TTSProvider({
   const seekTo = useCallback(
     (idx: number, playAfter?: boolean) => {
       const clamped = Math.max(0, Math.min(allWords.length - 1, Math.floor(idx)));
-      if (playAfter || status === "playing") speakFrom(clamped);
+      const shouldPlay = playAfter || status === "playing";
+      if (shouldPlay) speakFrom(clamped);
       else setCurrentWordIdx(clamped);
     },
     [allWords.length, speakFrom, status]
+  );
+
+  const seekToCharOffset = useCallback(
+    (charOffset: number, playAfter?: boolean) => {
+      const idx = wordIndexAt(allWords, Math.max(0, charOffset));
+      const shouldPlay = playAfter || status === "playing";
+      if (shouldPlay) speakFrom(idx);
+      else setCurrentWordIdx(idx);
+    },
+    [allWords, speakFrom, status]
   );
 
   const seekFrac = useCallback(
@@ -292,10 +306,12 @@ export function TTSProvider({
     elapsedSec,
     totalSec,
     progressPct,
+    clickToListen,
     play,
     pause,
     skip,
     seekTo,
+    seekToCharOffset,
     seekFrac,
     cycleRate,
     setVoice,

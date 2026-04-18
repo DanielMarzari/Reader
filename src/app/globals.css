@@ -180,6 +180,12 @@ body {
   position: relative;
   display: block;
   line-height: 0;
+  isolation: isolate;
+}
+.pdf-page-placeholder {
+  background: white;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  display: block;
 }
 .pdf-overlay {
   position: absolute;
@@ -187,10 +193,12 @@ body {
   left: 0;
   pointer-events: none;
   overflow: hidden;
+  z-index: 2;
 }
 .pdf-sentence-layer {
   position: absolute;
   inset: 0;
+  pointer-events: none;
   z-index: 1;
 }
 .pdf-sentence-rect {
@@ -198,10 +206,12 @@ body {
   background: var(--hglt-sentence);
   border-radius: 3px;
   pointer-events: none;
+  mix-blend-mode: multiply;
 }
 .pdf-word-pill {
   position: absolute;
   background: var(--hglt-word);
+  border: 1px solid rgba(47, 67, 250, 0.35);
   border-radius: 4px;
   padding: 0;
   pointer-events: none;
@@ -209,6 +219,14 @@ body {
   z-index: 2;
   box-sizing: border-box;
   mix-blend-mode: multiply;
+}
+.pdf-click-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  cursor: text;
+  background: transparent;
 }
 
 /* --- Buttons --- */

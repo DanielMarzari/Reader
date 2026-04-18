@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTTS } from "./tts/TTSContext";
 import {
   assemblePage,
-  safeNormalize,
   type ItemRange,
   type PdfItem,
 } from "@/lib/pdfAssembly";
@@ -19,21 +18,23 @@ type Props = {
 type PdfLibType = typeof import("pdfjs-dist");
 
 type ItemBox = {
-  localStart: number; // char offset within page.text
+  localStart: number;
   localEnd: number;
-  x: number; // CSS px relative to the canvas top-left
+  x: number;
   y: number;
   width: number;
   height: number;
 };
 
-type PageData = {
-  text: string; // same text the server stored (post-safeNormalize)
-  items: ItemBox[];
+type PageInfo = {
+  pageNum: number;
+  width: number; // CSS px
+  height: number;
+  items: ItemBox[] | null; // filled when the page is rendered
+  rendered: boolean;
 };
 
-// Multiply two 3×3 affine matrices flattened as [a,b,c,d,e,f]
-// (pdfjs convention: [a b; c d; e f]).
+// Multiply two affine matrices [a,b,c,d,e,f] (pdfjs convention).
 function matMul(a: number[], b: number[]): number[] {
   return [
     a[0] * b[0] + a[2] * b[1],
@@ -45,27 +46,48 @@ function matMul(a: number[], b: number[]): number[] {
   ];
 }
 
-export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentence }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const pageWrapRefs = useRef<(HTMLElement | null)[]>([]);
-  const overlayRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const wordPillRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const sentenceOverlayRefs = useRef<(HTMLDivElement | null)[]>([]);
+const MAX_LIVE_PAGES = 6;
 
-  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [error, setError] = useState<string | null>(null);
+export function PdfPagesViewer({
+  docId,
+  sourceType,
+  pageRanges,
+  highlightSentence,
+}: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pdfRef = useRef<import("pdfjs-dist").PDFDocumentProxy | null>(null);
+  const pageWrapRefs = useRef<HTMLDivElement[]>([]);
+  const wordPillRefs = useRef<HTMLDivElement[]>([]);
+  const sentenceOverlayRefs = useRef<HTMLDivElement[]>([]);
+  const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([]);
+  // LRU tracking of rendered pages: most-recently-rendered at end.
+  const renderedOrder = useRef<number[]>([]);
+  const renderingSet = useRef<Set<number>>(new Set());
+
+  const pagesRef = useRef<PageInfo[]>([]);
+  const [pagesReady, setPagesReady] = useState(false);
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
-  const [pagesData, setPagesData] = useState<PageData[]>([]);
+  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
+  // Bumps whenever a page's canvas/items finish rendering, to trigger
+  // the overlay-positioning effect.
+  const [renderTick, setRenderTick] = useState(0);
 
-  const { tokens, currentWordIdx } = useTTS();
+  const {
+    tokens,
+    currentWordIdx,
+    clickToListen,
+    seekToCharOffset,
+  } = useTTS();
+
   const currentWord = tokens.words[currentWordIdx];
   const currentCharOffset = currentWord?.start ?? 0;
   const currentSentence = currentWord
     ? tokens.sentences[currentWord.sentenceIndex]
     : null;
 
-  // Find page index covering currentCharOffset.
+  // --- Page index from current char offset ------------------------------
   useEffect(() => {
     if (!pageRanges || pageRanges.length === 0) return;
     let next = 0;
@@ -79,7 +101,7 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
     setCurrentPage((prev) => (prev === next ? prev : next));
   }, [currentCharOffset, pageRanges]);
 
-  // Scroll current page into view when it changes.
+  // --- Scroll current page into view ------------------------------------
   const lastScrolledRef = useRef<number>(-1);
   useEffect(() => {
     if (status !== "ready") return;
@@ -91,8 +113,324 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
     }
   }, [currentPage, status]);
 
-  // Position the word pill + sentence rects whenever the current
-  // word/sentence or page data changes.
+  // --- LRU render/evict -------------------------------------------------
+  const evictIfNeeded = useCallback(() => {
+    while (renderedOrder.current.length > MAX_LIVE_PAGES) {
+      // Evict the rendered page farthest from currentPage.
+      let farIdx = -1;
+      let farDist = -1;
+      for (const i of renderedOrder.current) {
+        if (i === currentPage) continue;
+        const d = Math.abs(i - currentPage);
+        if (d > farDist) {
+          farDist = d;
+          farIdx = i;
+        }
+      }
+      if (farIdx < 0) break;
+      const wrap = pageWrapRefs.current[farIdx];
+      if (wrap) {
+        const canvas = canvasRefs.current[farIdx];
+        if (canvas && canvas.parentElement) canvas.parentElement.removeChild(canvas);
+        canvasRefs.current[farIdx] = null;
+      }
+      const page = pagesRef.current[farIdx];
+      if (page) page.rendered = false;
+      renderedOrder.current = renderedOrder.current.filter((x) => x !== farIdx);
+    }
+  }, [currentPage]);
+
+  const renderPage = useCallback(async (index: number) => {
+    const pdf = pdfRef.current;
+    const page = pagesRef.current[index];
+    if (!pdf || !page) return;
+    if (page.rendered || renderingSet.current.has(index)) return;
+    renderingSet.current.add(index);
+    try {
+      const pdfjs = (await import("pdfjs-dist/build/pdf.mjs")) as unknown as PdfLibType;
+      const pdfPage = await pdf.getPage(index + 1);
+      const wrap = pageWrapRefs.current[index];
+      if (!wrap) return;
+      const containerWidth = wrap.clientWidth || page.width;
+      const viewport1 = pdfPage.getViewport({ scale: 1 });
+      const scale = containerWidth / viewport1.width;
+      const viewport = pdfPage.getViewport({ scale });
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const canvas = document.createElement("canvas");
+      canvas.className = "pdf-page";
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      canvas.width = Math.floor(viewport.width * dpr);
+      canvas.height = Math.floor(viewport.height * dpr);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.scale(dpr, dpr);
+
+      // Insert canvas as the first child of the "stack" inside the wrap
+      const stack = wrap.querySelector(".pdf-stack") as HTMLDivElement | null;
+      if (!stack) return;
+      stack.insertBefore(canvas, stack.firstChild);
+      canvasRefs.current[index] = canvas;
+
+      await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+
+      // Compute per-item char ranges + bboxes.
+      const textContent = await pdfPage.getTextContent();
+      const rawItems = textContent.items as PdfItem[];
+      const { itemRanges } = assemblePage(rawItems);
+
+      const itemBoxes: ItemBox[] = rawItems.map((item, i) => {
+        const r: ItemRange = itemRanges[i];
+        const tx = matMul(viewport.transform as number[], item.transform);
+        const fontHeight = Math.hypot(tx[2], tx[3]) || 12;
+        const widthPx = (item.width ?? 0) * scale;
+        return {
+          localStart: r.start,
+          localEnd: r.end,
+          x: tx[4],
+          y: tx[5] - fontHeight,
+          width: Math.max(widthPx, 2),
+          height: fontHeight,
+        };
+      });
+      page.items = itemBoxes;
+      page.rendered = true;
+      // Touch in LRU
+      renderedOrder.current = renderedOrder.current.filter((x) => x !== index);
+      renderedOrder.current.push(index);
+      void pdfjs; // silence unused var lint
+      setRenderTick((t) => t + 1);
+      evictIfNeeded();
+    } catch (err) {
+      console.warn(`Failed to render PDF page ${index + 1}:`, err);
+    } finally {
+      renderingSet.current.delete(index);
+    }
+  }, [evictIfNeeded]);
+
+  // --- Load PDF, measure all pages, set up placeholders & observer -----
+  useEffect(() => {
+    let cancelled = false;
+
+    if (sourceType !== "pdf") {
+      setStatus("error");
+      setError(
+        sourceType === "epub"
+          ? "Page view for EPUBs is coming soon. Use the Text tab for now."
+          : "Pasted text doesn't have a page view. Use the Text tab."
+      );
+      return;
+    }
+
+    async function run() {
+      setStatus("loading");
+      setError(null);
+      try {
+        const pdfjs = (await import("pdfjs-dist/build/pdf.mjs")) as unknown as PdfLibType;
+        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.mjs";
+
+        const res = await fetch(`/api/documents/${docId}/file`);
+        if (!res.ok) {
+          throw new Error(
+            res.status === 404
+              ? "Original PDF wasn't stored for this document. Re-upload it to enable the Pages view."
+              : `Failed to load PDF (${res.status}).`
+          );
+        }
+        const buf = await res.arrayBuffer();
+        if (cancelled) return;
+
+        const pdf = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+        if (cancelled) return;
+        pdfRef.current = pdf;
+
+        const container = containerRef.current;
+        if (!container) return;
+        const containerWidth = Math.min(container.clientWidth - 32, 880);
+
+        // Measure every page without rendering.
+        const infos: PageInfo[] = new Array(pdf.numPages);
+        for (let i = 1; i <= pdf.numPages; i++) {
+          if (cancelled) return;
+          const page = await pdf.getPage(i);
+          const vp1 = page.getViewport({ scale: 1 });
+          const scale = containerWidth / vp1.width;
+          const vp = page.getViewport({ scale });
+          infos[i - 1] = {
+            pageNum: i,
+            width: vp.width,
+            height: vp.height,
+            items: null,
+            rendered: false,
+          };
+        }
+        if (cancelled) return;
+
+        pagesRef.current = infos;
+        setPageCount(pdf.numPages);
+
+        // Build placeholder DOM.
+        container.innerHTML = "";
+        pageWrapRefs.current = new Array(pdf.numPages);
+        wordPillRefs.current = new Array(pdf.numPages);
+        sentenceOverlayRefs.current = new Array(pdf.numPages);
+        canvasRefs.current = new Array(pdf.numPages).fill(null);
+
+        for (let i = 0; i < infos.length; i++) {
+          const info = infos[i];
+          const wrap = document.createElement("div");
+          wrap.className = "pdf-page-wrap";
+          wrap.style.width = `${info.width}px`;
+          wrap.dataset.pageIdx = String(i);
+
+          const stack = document.createElement("div");
+          stack.className = "pdf-stack";
+          stack.style.width = `${info.width}px`;
+          stack.style.height = `${info.height}px`;
+
+          // Placeholder rect (white, same size as the eventual canvas)
+          const placeholder = document.createElement("div");
+          placeholder.className = "pdf-page-placeholder";
+          placeholder.style.width = `${info.width}px`;
+          placeholder.style.height = `${info.height}px`;
+          stack.appendChild(placeholder);
+
+          // Overlay: sentence rects + word pill.
+          const overlay = document.createElement("div");
+          overlay.className = "pdf-overlay";
+          overlay.style.width = `${info.width}px`;
+          overlay.style.height = `${info.height}px`;
+
+          const sentenceLayer = document.createElement("div");
+          sentenceLayer.className = "pdf-sentence-layer";
+          overlay.appendChild(sentenceLayer);
+
+          const wordPill = document.createElement("div");
+          wordPill.className = "pdf-word-pill";
+          wordPill.style.display = "none";
+          overlay.appendChild(wordPill);
+
+          stack.appendChild(overlay);
+
+          // Click layer for hit-testing
+          const clickLayer = document.createElement("div");
+          clickLayer.className = "pdf-click-layer";
+          clickLayer.style.width = `${info.width}px`;
+          clickLayer.style.height = `${info.height}px`;
+          clickLayer.dataset.pageIdx = String(i);
+          stack.appendChild(clickLayer);
+
+          const label = document.createElement("div");
+          label.className = "pdf-page-label";
+          label.textContent = `Page ${info.pageNum}`;
+
+          wrap.appendChild(stack);
+          wrap.appendChild(label);
+          container.appendChild(wrap);
+
+          pageWrapRefs.current[i] = wrap;
+          wordPillRefs.current[i] = wordPill;
+          sentenceOverlayRefs.current[i] = sentenceLayer;
+        }
+
+        // IntersectionObserver: render pages that are near viewport
+        const io = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) {
+                const idx = Number((entry.target as HTMLElement).dataset.pageIdx);
+                if (!Number.isNaN(idx)) renderPage(idx);
+              }
+            }
+          },
+          { rootMargin: "600px 0px" }
+        );
+        for (const wrap of pageWrapRefs.current) io.observe(wrap);
+
+        setPagesReady(true);
+        setStatus("ready");
+
+        // Kick off initial render of the current page + neighbours.
+        const startIdx = Math.max(
+          0,
+          Math.min(pdf.numPages - 1, currentPage)
+        );
+        for (let d = 0; d <= 2 && !cancelled; d++) {
+          const a = startIdx - d;
+          const b = startIdx + d;
+          if (a >= 0) renderPage(a);
+          if (b !== a && b < pdf.numPages) renderPage(b);
+        }
+
+        return () => io.disconnect();
+      } catch (err) {
+        if (cancelled) return;
+        console.error("PDF load failed:", err);
+        setError((err as Error).message);
+        setStatus("error");
+      }
+    }
+
+    run();
+    return () => {
+      cancelled = true;
+      renderedOrder.current = [];
+      renderingSet.current.clear();
+      pagesRef.current = [];
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docId, sourceType]);
+
+  // --- Click hit-testing on the click layer -----------------------------
+  useEffect(() => {
+    if (!pagesReady) return;
+    const handlers: Array<() => void> = [];
+    for (let i = 0; i < pageWrapRefs.current.length; i++) {
+      const wrap = pageWrapRefs.current[i];
+      if (!wrap) continue;
+      const click = wrap.querySelector(".pdf-click-layer") as HTMLDivElement | null;
+      if (!click) continue;
+      const handler = (ev: MouseEvent) => {
+        const page = pagesRef.current[i];
+        if (!page || !page.items || !pageRanges) return;
+        const rect = click.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        const y = ev.clientY - rect.top;
+        // Find item whose bbox contains (x, y). Try exact hit, then
+        // fall back to the closest item on the clicked line.
+        let hit = page.items.find(
+          (it) =>
+            x >= it.x &&
+            x < it.x + it.width &&
+            y >= it.y &&
+            y < it.y + it.height + 2
+        );
+        if (!hit) {
+          // Closest on the nearest line
+          const rowTol = 8;
+          const inRow = page.items.filter((it) => Math.abs(it.y - y) < it.height + rowTol);
+          if (inRow.length) {
+            hit = inRow.reduce((best, cur) => {
+              const bd = Math.min(Math.abs(best.x - x), Math.abs(best.x + best.width - x));
+              const cd = Math.min(Math.abs(cur.x - x), Math.abs(cur.x + cur.width - x));
+              return cd < bd ? cur : best;
+            });
+          }
+        }
+        if (!hit) return;
+        const globalOffset = pageRanges[i].charStart + hit.localStart;
+        seekToCharOffset(globalOffset, clickToListen);
+      };
+      click.addEventListener("click", handler);
+      handlers.push(() => click.removeEventListener("click", handler));
+    }
+    return () => {
+      for (const off of handlers) off();
+    };
+  }, [pagesReady, pageRanges, seekToCharOffset, clickToListen]);
+
+  // --- Position overlays on the active page ----------------------------
   useEffect(() => {
     if (status !== "ready") return;
     if (!pageRanges) return;
@@ -103,25 +441,31 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
       else el.classList.remove("pdf-page-current");
     });
 
-    // Hide all overlays, then draw on the active page only.
-    wordPillRefs.current.forEach((el) => {
-      if (el) el.style.display = "none";
-    });
-    sentenceOverlayRefs.current.forEach((el) => {
-      if (el) el.innerHTML = "";
-    });
+    // Hide all pills + clear sentence overlays.
+    for (const pill of wordPillRefs.current) if (pill) pill.style.display = "none";
+    for (const s of sentenceOverlayRefs.current) if (s) s.innerHTML = "";
 
-    const pageIdx = currentPage;
-    const data = pagesData[pageIdx];
-    const range = pageRanges[pageIdx];
-    if (!data || !range) return;
+    const idx = currentPage;
+    const page = pagesRef.current[idx];
+    const range = pageRanges[idx];
+    if (!page || !page.items || !range) return;
 
-    // Word pill: find item covering local offset.
     const localOffset = currentCharOffset - range.charStart;
-    const item = data.items.find(
+
+    // Word pill: find the item containing localOffset. If none, try the
+    // last item with localStart <= localOffset.
+    let item = page.items.find(
       (it) => localOffset >= it.localStart && localOffset < it.localEnd
     );
-    const pill = wordPillRefs.current[pageIdx];
+    if (!item) {
+      for (let i = page.items.length - 1; i >= 0; i--) {
+        if (page.items[i].localStart <= localOffset) {
+          item = page.items[i];
+          break;
+        }
+      }
+    }
+    const pill = wordPillRefs.current[idx];
     if (item && pill) {
       pill.style.display = "block";
       pill.style.left = `${item.x}px`;
@@ -130,16 +474,14 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
       pill.style.height = `${item.height}px`;
     }
 
-    // Sentence overlay: union of items intersecting the sentence's
-    // local range, grouped by row (y band) to render one rect per line.
+    // Sentence rects
     if (highlightSentence && currentSentence) {
       const sentStart = currentSentence.start - range.charStart;
       const sentEnd = currentSentence.end - range.charStart;
-      const items = data.items.filter(
+      const items = page.items.filter(
         (it) => it.localEnd > sentStart && it.localStart < sentEnd
       );
       if (items.length) {
-        // Group by y-row (cluster by top within a tolerance).
         const tol = 6;
         const rows: ItemBox[][] = [];
         for (const it of items) {
@@ -147,7 +489,7 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
           if (row) row.push(it);
           else rows.push([it]);
         }
-        const overlay = sentenceOverlayRefs.current[pageIdx];
+        const overlay = sentenceOverlayRefs.current[idx];
         if (overlay) {
           for (const row of rows) {
             const xMin = Math.min(...row.map((it) => it.x));
@@ -170,155 +512,18 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
     currentPage,
     currentCharOffset,
     currentSentence,
-    pagesData,
-    pageRanges,
     highlightSentence,
+    pageRanges,
+    renderTick,
   ]);
 
-  // Load PDF and render pages.
+  // --- Ensure the active page is always rendered ------------------------
   useEffect(() => {
-    let cancelled = false;
-
-    if (sourceType !== "pdf") {
-      setStatus("error");
-      setError(
-        sourceType === "epub"
-          ? "Page view for EPUBs is coming soon. Use the Text tab for now."
-          : "Pasted text doesn't have a page view. Use the Text tab."
-      );
-      return;
-    }
-
-    async function render() {
-      setStatus("loading");
-      setError(null);
-      try {
-        const pdfjs = (await import("pdfjs-dist/build/pdf.mjs")) as unknown as PdfLibType;
-        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.mjs";
-
-        const res = await fetch(`/api/documents/${docId}/file`);
-        if (!res.ok) {
-          throw new Error(
-            res.status === 404
-              ? "Original PDF wasn't stored for this document. Re-upload it to enable the Pages view."
-              : `Failed to load PDF (${res.status}).`
-          );
-        }
-        const buf = await res.arrayBuffer();
-        if (cancelled) return;
-
-        const pdf = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
-        if (cancelled) return;
-        setPageCount(pdf.numPages);
-        pageWrapRefs.current = new Array(pdf.numPages).fill(null);
-        overlayRefs.current = new Array(pdf.numPages).fill(null);
-        wordPillRefs.current = new Array(pdf.numPages).fill(null);
-        sentenceOverlayRefs.current = new Array(pdf.numPages).fill(null);
-
-        const container = containerRef.current;
-        if (!container) return;
-        container.innerHTML = "";
-
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const collected: PageData[] = new Array(pdf.numPages);
-
-        for (let i = 1; i <= pdf.numPages; i++) {
-          if (cancelled) return;
-          const page = await pdf.getPage(i);
-          const containerWidth = Math.min(container.clientWidth - 32, 880);
-          const viewport1 = page.getViewport({ scale: 1 });
-          const scale = containerWidth / viewport1.width;
-          const viewport = page.getViewport({ scale });
-
-          const wrap = document.createElement("div");
-          wrap.className = "pdf-page-wrap";
-          wrap.style.width = `${viewport.width}px`;
-
-          const canvas = document.createElement("canvas");
-          canvas.className = "pdf-page";
-          canvas.style.width = `${viewport.width}px`;
-          canvas.style.height = `${viewport.height}px`;
-          canvas.width = Math.floor(viewport.width * dpr);
-          canvas.height = Math.floor(viewport.height * dpr);
-          const ctx = canvas.getContext("2d");
-          if (!ctx) continue;
-          ctx.scale(dpr, dpr);
-
-          const overlay = document.createElement("div");
-          overlay.className = "pdf-overlay";
-          overlay.style.width = `${viewport.width}px`;
-          overlay.style.height = `${viewport.height}px`;
-
-          const sentenceLayer = document.createElement("div");
-          sentenceLayer.className = "pdf-sentence-layer";
-          overlay.appendChild(sentenceLayer);
-
-          const wordPill = document.createElement("div");
-          wordPill.className = "pdf-word-pill";
-          wordPill.style.display = "none";
-          overlay.appendChild(wordPill);
-
-          const stack = document.createElement("div");
-          stack.className = "pdf-stack";
-          stack.appendChild(canvas);
-          stack.appendChild(overlay);
-
-          const label = document.createElement("div");
-          label.className = "pdf-page-label";
-          label.textContent = `Page ${i}`;
-
-          wrap.appendChild(stack);
-          wrap.appendChild(label);
-          container.appendChild(wrap);
-
-          pageWrapRefs.current[i - 1] = wrap;
-          overlayRefs.current[i - 1] = overlay;
-          sentenceOverlayRefs.current[i - 1] = sentenceLayer;
-          wordPillRefs.current[i - 1] = wordPill;
-
-          await page.render({ canvasContext: ctx, viewport }).promise;
-
-          // Compute per-item char ranges (local) and bounding boxes.
-          const textContent = await page.getTextContent();
-          const items = textContent.items as PdfItem[];
-          const { text, itemRanges } = assemblePage(items);
-          const safeText = safeNormalize(text); // same as server-side
-
-          const itemBoxes: ItemBox[] = items.map((item: PdfItem, idx: number) => {
-            const range: ItemRange = itemRanges[idx];
-            const tx = matMul(viewport.transform as number[], item.transform);
-            const fontHeight = Math.hypot(tx[2], tx[3]) || 12;
-            const widthPx = (item.width ?? 0) * scale;
-            return {
-              localStart: range.start,
-              localEnd: range.end,
-              x: tx[4],
-              y: tx[5] - fontHeight,
-              width: Math.max(widthPx, 2),
-              height: fontHeight,
-            };
-          });
-
-          collected[i - 1] = { text: safeText, items: itemBoxes };
-        }
-
-        if (!cancelled) {
-          setPagesData(collected);
-          setStatus("ready");
-        }
-      } catch (err) {
-        if (cancelled) return;
-        console.error("PDF render failed:", err);
-        setError((err as Error).message);
-        setStatus("error");
-      }
-    }
-
-    render();
-    return () => {
-      cancelled = true;
-    };
-  }, [docId, sourceType]);
+    if (!pagesReady) return;
+    renderPage(currentPage);
+    renderPage(currentPage + 1);
+    renderPage(currentPage - 1);
+  }, [currentPage, pagesReady, renderPage]);
 
   if (status === "error") {
     return (
@@ -333,7 +538,7 @@ export function PdfPagesViewer({ docId, sourceType, pageRanges, highlightSentenc
   return (
     <div className="pages-canvas">
       {status === "loading" && (
-        <div className="text-sm text-[color:var(--muted)] py-8">Rendering PDF…</div>
+        <div className="text-sm text-[color:var(--muted)] py-8">Loading PDF…</div>
       )}
       <div ref={containerRef} className="w-full flex flex-col items-center gap-4" />
       {status === "ready" && (
