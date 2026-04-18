@@ -25,13 +25,18 @@ export function countWords(text: string): number {
   return m ? m.length : 0;
 }
 
-/** PDF: use pdfjs-dist legacy build in Node. */
-export async function parsePdf(buffer: Buffer): Promise<string> {
+export type PdfPageRange = { charStart: number; charEnd: number };
+
+export type PdfParseResult = {
+  content: string;
+  pageRanges: PdfPageRange[];
+};
+
+/** PDF: use pdfjs-dist legacy build in Node. Also returns per-page char
+ *  ranges so the Pages tab can scroll-follow the current reading position. */
+export async function parsePdf(buffer: Buffer): Promise<PdfParseResult> {
   // @ts-expect-error legacy build
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  // Point pdfjs at the worker file we bundled via outputFileTracingIncludes.
-  // In standalone mode this resolves to node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs
-  // relative to process.cwd().
   try {
     const { createRequire } = await import("node:module");
     const req = createRequire(import.meta.url);
@@ -47,13 +52,18 @@ export async function parsePdf(buffer: Buffer): Promise<string> {
     isEvalSupported: false,
   });
   const pdf = await loadingTask.promise;
-  const pages: string[] = [];
+
+  const pageTexts: string[] = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
     let lastY: number | null = null;
     let pageText = "";
-    for (const item of content.items as Array<{ str: string; transform: number[]; hasEOL?: boolean }>) {
+    for (const item of content.items as Array<{
+      str: string;
+      transform: number[];
+      hasEOL?: boolean;
+    }>) {
       const y = item.transform?.[5];
       if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 2) {
         pageText += "\n";
@@ -62,10 +72,32 @@ export async function parsePdf(buffer: Buffer): Promise<string> {
       if (item.hasEOL) pageText += "\n";
       lastY = y ?? lastY;
     }
-    pages.push(pageText);
+    pageTexts.push(normalize(pageText));
   }
   await pdf.destroy();
-  return normalize(pages.join("\n\n"));
+
+  // Join normalized pages with a blank line. Record each page's offset
+  // into the combined content string.
+  const SEP = "\n\n";
+  const pageRanges: PdfPageRange[] = [];
+  let cursor = 0;
+  const parts: string[] = [];
+  for (let i = 0; i < pageTexts.length; i++) {
+    const t = pageTexts[i];
+    if (!t) {
+      pageRanges.push({ charStart: cursor, charEnd: cursor });
+      continue;
+    }
+    if (i > 0 && parts.length > 0) {
+      parts.push(SEP);
+      cursor += SEP.length;
+    }
+    const start = cursor;
+    parts.push(t);
+    cursor += t.length;
+    pageRanges.push({ charStart: start, charEnd: cursor });
+  }
+  return { content: parts.join(""), pageRanges };
 }
 
 /** Strip HTML/XHTML → plain text, preserving paragraph breaks and headings. */

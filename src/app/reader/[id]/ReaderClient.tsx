@@ -20,6 +20,7 @@ type Props = {
   sourceType: "pdf" | "epub" | "text";
   wordCount: number;
   content: string;
+  pageRanges: Array<{ charStart: number; charEnd: number }> | null;
   initialCharIndex: number;
   initialRate: number;
   initialVoiceName: string | null;
@@ -33,6 +34,7 @@ export function ReaderClient({
   sourceType,
   wordCount,
   content,
+  pageRanges,
   initialCharIndex,
   initialRate,
   initialVoiceName,
@@ -57,6 +59,7 @@ export function ReaderClient({
       initialRate={initialRate}
       initialVoiceName={initialVoiceName}
       clickToListen={settings.clickToListen}
+      autoSkip={settings.autoSkip}
     >
       <div className="min-h-screen flex flex-col">
         <nav className="reader-nav">
@@ -114,7 +117,11 @@ export function ReaderClient({
           {tab === "text" ? (
             <TTSContent highlightSentence={settings.highlightSentence} />
           ) : (
-            <PdfPagesViewer docId={docId} sourceType={sourceType} />
+            <PdfPagesViewer
+              docId={docId}
+              sourceType={sourceType}
+              pageRanges={pageRanges}
+            />
           )}
         </main>
 

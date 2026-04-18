@@ -26,15 +26,16 @@ function ensureAllTables(db: Database.Database) {
       word_count INTEGER NOT NULL DEFAULT 0,
       char_count INTEGER NOT NULL DEFAULT 0,
       stored_path TEXT,
+      pages_meta TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  // Additive migration for older databases
+  // Additive migrations for older databases
   const cols = db.prepare(`PRAGMA table_info(documents)`).all() as Array<{ name: string }>;
-  if (!cols.some((c) => c.name === "stored_path")) {
-    db.exec(`ALTER TABLE documents ADD COLUMN stored_path TEXT`);
-  }
+  const has = (n: string) => cols.some((c) => c.name === n);
+  if (!has("stored_path")) db.exec(`ALTER TABLE documents ADD COLUMN stored_path TEXT`);
+  if (!has("pages_meta")) db.exec(`ALTER TABLE documents ADD COLUMN pages_meta TEXT`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS reading_positions (
@@ -76,6 +77,7 @@ export type DocumentRow = {
   word_count: number;
   char_count: number;
   stored_path: string | null;
+  pages_meta: string | null;
   created_at: string;
   updated_at: string;
 };

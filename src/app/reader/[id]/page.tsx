@@ -20,6 +20,7 @@ export default async function ReaderPage({
       sourceType={doc.sourceType}
       wordCount={doc.wordCount}
       content={doc.content}
+      pageRanges={doc.pageRanges ?? null}
       initialCharIndex={doc.position?.charIndex ?? 0}
       initialRate={doc.position?.rate ?? 1}
       initialVoiceName={doc.position?.voiceName ?? null}

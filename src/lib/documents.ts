@@ -83,7 +83,15 @@ export function getDocument(id: string): DocumentDetail | null {
     )
     .all(id) as CollectionRow[];
   const summary = rowToSummary(d, position, colls);
-  return { ...summary, content: d.content };
+
+  let pageRanges: DocumentDetail["pageRanges"] = null;
+  if (d.pages_meta) {
+    try {
+      const parsed = JSON.parse(d.pages_meta);
+      if (Array.isArray(parsed)) pageRanges = parsed;
+    } catch {}
+  }
+  return { ...summary, content: d.content, pageRanges };
 }
 
 export function insertDocument(doc: {
@@ -94,15 +102,17 @@ export function insertDocument(doc: {
   content: string;
   wordCount: number;
   storedPath?: string | null;
+  pageRanges?: Array<{ charStart: number; charEnd: number }> | null;
 }) {
   const db = getDb();
   db.prepare(
-    `INSERT INTO documents (id, title, source_type, original_filename, content, word_count, char_count, stored_path)
-     VALUES (@id, @title, @sourceType, @originalFilename, @content, @wordCount, @charCount, @storedPath)`
+    `INSERT INTO documents (id, title, source_type, original_filename, content, word_count, char_count, stored_path, pages_meta)
+     VALUES (@id, @title, @sourceType, @originalFilename, @content, @wordCount, @charCount, @storedPath, @pagesMeta)`
   ).run({
     ...doc,
     charCount: doc.content.length,
     storedPath: doc.storedPath ?? null,
+    pagesMeta: doc.pageRanges ? JSON.stringify(doc.pageRanges) : null,
   });
 }
 

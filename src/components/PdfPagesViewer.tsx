@@ -1,24 +1,57 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-
-// Client-side rendering of the original PDF using pdfjs-dist.
-// Loads the file from /api/documents/[id]/file and renders each page
-// into a <canvas>. Worker ships from /pdf.worker.mjs (copied via prebuild).
+import { useTTS } from "./tts/TTSContext";
 
 type Props = {
   docId: string;
   sourceType: "pdf" | "epub" | "text";
+  pageRanges: Array<{ charStart: number; charEnd: number }> | null;
 };
 
 type PdfLibType = typeof import("pdfjs-dist");
 
-export function PdfPagesViewer({ docId, sourceType }: Props) {
+export function PdfPagesViewer({ docId, sourceType, pageRanges }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const pageRefs = useRef<(HTMLElement | null)[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(0);
 
+  const { tokens, currentWordIdx } = useTTS();
+
+  // Global char offset of the current word (index into `content` string).
+  const currentCharOffset =
+    tokens.words[currentWordIdx]?.start ?? 0;
+
+  // Map current char offset → page index (0-based).
+  useEffect(() => {
+    if (!pageRanges || pageRanges.length === 0) return;
+    let next = 0;
+    for (let i = 0; i < pageRanges.length; i++) {
+      if (currentCharOffset < pageRanges[i].charEnd) {
+        next = i;
+        break;
+      }
+      next = i;
+    }
+    setCurrentPage((prev) => (prev === next ? prev : next));
+  }, [currentCharOffset, pageRanges]);
+
+  // Scroll the current page into view (debounced; smooth).
+  const lastScrolledRef = useRef<number>(-1);
+  useEffect(() => {
+    if (status !== "ready") return;
+    if (currentPage === lastScrolledRef.current) return;
+    const el = pageRefs.current[currentPage];
+    if (el) {
+      el.scrollIntoView({ block: "start", behavior: "smooth" });
+      lastScrolledRef.current = currentPage;
+    }
+  }, [currentPage, status]);
+
+  // Render the PDF.
   useEffect(() => {
     let cancelled = false;
 
@@ -37,14 +70,13 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
       setError(null);
       try {
         const pdfjs = (await import("pdfjs-dist/build/pdf.mjs")) as unknown as PdfLibType;
-        // Worker is served from /pdf.worker.mjs (see prebuild script).
         pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.mjs";
 
         const res = await fetch(`/api/documents/${docId}/file`);
         if (!res.ok) {
           throw new Error(
             res.status === 404
-              ? "Original PDF wasn't stored for this document."
+              ? "Original PDF wasn't stored for this document. Re-upload it to enable the Pages view."
               : `Failed to load PDF (${res.status}).`
           );
         }
@@ -54,6 +86,7 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
         const pdf = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
         if (cancelled) return;
         setPageCount(pdf.numPages);
+        pageRefs.current = new Array(pdf.numPages).fill(null);
 
         const container = containerRef.current;
         if (!container) return;
@@ -64,11 +97,15 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
         for (let i = 1; i <= pdf.numPages; i++) {
           if (cancelled) return;
           const page = await pdf.getPage(i);
-          // Fit to container width; cap at ~880px.
           const containerWidth = Math.min(container.clientWidth - 32, 880);
           const viewport1 = page.getViewport({ scale: 1 });
           const scale = containerWidth / viewport1.width;
           const viewport = page.getViewport({ scale });
+
+          const wrap = document.createElement("div");
+          wrap.className = "pdf-page-wrap";
+          wrap.dataset.page = String(i - 1);
+          wrap.style.width = `${viewport.width}px`;
 
           const canvas = document.createElement("canvas");
           canvas.className = "pdf-page";
@@ -81,11 +118,13 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
           ctx.scale(dpr, dpr);
 
           const label = document.createElement("div");
-          label.className = "text-xs text-[color:var(--muted)] mt-1";
+          label.className = "pdf-page-label";
           label.textContent = `Page ${i}`;
 
-          container.appendChild(canvas);
-          container.appendChild(label);
+          wrap.appendChild(canvas);
+          wrap.appendChild(label);
+          container.appendChild(wrap);
+          pageRefs.current[i - 1] = wrap;
 
           await page.render({ canvasContext: ctx, viewport }).promise;
         }
@@ -105,6 +144,15 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
     };
   }, [docId, sourceType]);
 
+  // Apply highlight class to the active page wrapper.
+  useEffect(() => {
+    pageRefs.current.forEach((el, i) => {
+      if (!el) return;
+      if (i === currentPage) el.classList.add("pdf-page-current");
+      else el.classList.remove("pdf-page-current");
+    });
+  }, [currentPage, pageCount]);
+
   if (status === "error") {
     return (
       <div className="pages-canvas">
@@ -123,7 +171,7 @@ export function PdfPagesViewer({ docId, sourceType }: Props) {
       <div ref={containerRef} className="w-full flex flex-col items-center gap-4" />
       {status === "ready" && (
         <div className="text-xs text-[color:var(--muted)] mt-4">
-          {pageCount} page{pageCount === 1 ? "" : "s"}
+          Page {currentPage + 1} of {pageCount}
         </div>
       )}
     </div>

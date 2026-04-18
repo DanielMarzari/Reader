@@ -14,6 +14,7 @@ export type DocumentSummary = {
 
 export type DocumentDetail = DocumentSummary & {
   content: string;
+  pageRanges: Array<{ charStart: number; charEnd: number }> | null;
 };
 
 export type PositionInfo = {

@@ -20,6 +20,7 @@ export async function POST(req: NextRequest) {
   let originalFilename: string | null = null;
   let content = "";
   let originalBuffer: Buffer | null = null;
+  let pageRanges: Array<{ charStart: number; charEnd: number }> | null = null;
 
   if (contentType.includes("multipart/form-data")) {
     const form = await req.formData();
@@ -36,7 +37,9 @@ export async function POST(req: NextRequest) {
     try {
       if (lower.endsWith(".pdf") || file.type === "application/pdf") {
         sourceType = "pdf";
-        content = await parsePdf(buffer);
+        const parsed = await parsePdf(buffer);
+        content = parsed.content;
+        pageRanges = parsed.pageRanges;
       } else if (lower.endsWith(".epub") || file.type === "application/epub+zip") {
         sourceType = "epub";
         const parsed = await parseEpub(buffer);
@@ -103,6 +106,7 @@ export async function POST(req: NextRequest) {
     content,
     wordCount: countWords(content),
     storedPath,
+    pageRanges,
   });
 
   return NextResponse.json({ id });

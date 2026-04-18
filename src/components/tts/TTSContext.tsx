@@ -10,6 +10,11 @@ import {
   useState,
 } from "react";
 import { tokenize, wordIndexAt, type Tokenized } from "@/lib/tokenize";
+import {
+  defaultAutoSkip,
+  preprocessForSpeech,
+  type AutoSkipSettings,
+} from "@/lib/autoskip";
 
 const WORDS_PER_SECOND = 2.5;
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
@@ -53,6 +58,7 @@ export function TTSProvider({
   initialRate,
   initialVoiceName,
   clickToListen,
+  autoSkip = defaultAutoSkip,
   children,
 }: {
   docId: string;
@@ -61,6 +67,7 @@ export function TTSProvider({
   initialRate: number;
   initialVoiceName: string | null;
   clickToListen: boolean;
+  autoSkip?: AutoSkipSettings;
   children: React.ReactNode;
 }) {
   const tokens = useMemo<Tokenized>(() => tokenize(content), [content]);
@@ -78,9 +85,13 @@ export function TTSProvider({
   const manualStopRef = useRef(false);
   const savedIdxRef = useRef<number>(currentWordIdx);
   const clickToListenRef = useRef(clickToListen);
+  const autoSkipRef = useRef<AutoSkipSettings>(autoSkip);
   useEffect(() => {
     clickToListenRef.current = clickToListen;
   }, [clickToListen]);
+  useEffect(() => {
+    autoSkipRef.current = autoSkip;
+  }, [autoSkip]);
 
   // Load voices.
   useEffect(() => {
@@ -153,7 +164,10 @@ export function TTSProvider({
         return;
       }
       const startChar = allWords[startWordIdx].start;
-      const tail = content.slice(startChar);
+      const rawTail = content.slice(startChar);
+      // Auto-skip: equal-length redaction preserves char offsets so
+      // onboundary events still correctly index the displayed content.
+      const tail = preprocessForSpeech(rawTail, autoSkipRef.current);
       utteranceBaseRef.current = startChar;
 
       const u = new SpeechSynthesisUtterance(tail);
