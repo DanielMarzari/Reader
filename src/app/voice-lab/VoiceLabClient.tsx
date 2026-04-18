@@ -58,20 +58,7 @@ export function VoiceLabClient() {
               ←
             </Link>
             <div className="flex items-center gap-2">
-              <div
-                className="voice-sphere voice-sphere-static"
-                aria-hidden
-                style={
-                  {
-                    width: "32px",
-                    height: "32px",
-                    "--c1": "#f6b4a6",
-                    "--c2": "#d58cff",
-                    "--c3": "#6190ff",
-                    "--c4": "#9effd8",
-                  } as React.CSSProperties & Record<string, string>
-                }
-              />
+              <VoiceSphere seed="voice-lab-logo" size={32} />
               <h1 className="text-lg font-bold">Voice Lab</h1>
             </div>
           </div>
@@ -168,6 +155,7 @@ function VoiceCard({
         <VoiceSphere
           seed={voice.id}
           size={160}
+          speaking={playing}
           withPlayIcon={!playing}
           onClick={voice.hasSample ? onPlay : undefined}
           ariaLabel={`Play ${voice.name}`}
