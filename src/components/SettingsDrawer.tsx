@@ -6,7 +6,6 @@ import {
   defaultAutoSkip,
   type AutoSkipSettings,
 } from "@/lib/autoskip";
-import { useTTS, type TTSEngine } from "@/components/tts/TTSContext";
 
 type Theme = "system" | "light" | "dark";
 export type View = "text" | "pages";
@@ -17,7 +16,6 @@ export type ReaderSettings = {
   highlightSentence: boolean;
   clickToListen: boolean;
   autoSkip: AutoSkipSettings;
-  ttsEngine: TTSEngine;
 };
 
 export const defaultSettings: ReaderSettings = {
@@ -26,7 +24,6 @@ export const defaultSettings: ReaderSettings = {
   highlightSentence: true,
   clickToListen: false,
   autoSkip: defaultAutoSkip,
-  ttsEngine: "browser",
 };
 
 export function applyTheme(theme: Theme) {
@@ -90,7 +87,8 @@ export function SettingsDrawer({
   pagesAvailable: boolean;
 }) {
   const [panel, setPanel] = useState<"main" | "autoskip">("main");
-  const { engine, setEngine, voiceStudioAvailable, engineError } = useTTS();
+  // Nothing from the TTS context is needed in Settings anymore — the
+  // engine toggle is gone (see the plan file). Kept useTTS import out.
 
   if (!open) return null;
 
@@ -154,44 +152,6 @@ export function SettingsDrawer({
                 })}
               </div>
             </section>
-
-            <section className="flex items-start justify-between gap-4">
-              <div>
-                <div className="text-sm font-medium">Audio Engine</div>
-                <div className="text-xs text-[color:var(--muted)]">
-                  {voiceStudioAvailable
-                    ? "Browser voices are free; Voice Studio uses your cloned voices via F5-TTS or XTTS on your Mac."
-                    : "Voice Studio isn't running — start it locally (./start.sh) to use cloned voices."}
-                </div>
-              </div>
-              <div className="seg">
-                {(["browser", "voice-studio"] as TTSEngine[]).map((e) => {
-                  const disabled = e === "voice-studio" && !voiceStudioAvailable;
-                  return (
-                    <button
-                      key={e}
-                      className={engine === e ? "active" : ""}
-                      onClick={() => !disabled && setEngine(e)}
-                      disabled={disabled}
-                      title={
-                        disabled
-                          ? "Voice Studio not reachable at http://localhost:8000"
-                          : ""
-                      }
-                      style={disabled ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
-                    >
-                      {e === "browser" ? "Browser" : "Voice Studio"}
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-
-            {engine === "voice-studio" && engineError && (
-              <div className="text-xs text-red-500 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
-                {engineError}
-              </div>
-            )}
 
             <section className="flex items-start justify-between gap-4">
               <div>

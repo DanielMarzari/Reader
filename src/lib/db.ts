@@ -148,6 +148,30 @@ function ensureAllTables(db: Database.Database) {
       last_used_at TEXT
     )
   `);
+
+  // Render jobs — Voice Studio (running on the user's Mac) polls this
+  // table for pending jobs, claims one, synthesizes, and ships chunks back.
+  // One audiobook per (document, voice) pair; UNIQUE enforces that.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS render_jobs (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      voice_id TEXT NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+      status TEXT NOT NULL
+        CHECK (status IN ('pending','rendering','ready','failed','cancelled')),
+      priority TEXT NOT NULL DEFAULT 'high',
+      chunks_total INTEGER,
+      chunks_done INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      claimed_at TEXT,
+      completed_at TEXT,
+      UNIQUE (document_id, voice_id)
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status, priority, requested_at)`
+  );
 }
 
 export type DocumentRow = {
@@ -194,4 +218,25 @@ export type VoiceLabTokenRow = {
   label: string | null;
   created_at: string;
   last_used_at: string | null;
+};
+
+export type RenderJobStatus =
+  | "pending"
+  | "rendering"
+  | "ready"
+  | "failed"
+  | "cancelled";
+
+export type RenderJobRow = {
+  id: string;
+  document_id: string;
+  voice_id: string;
+  status: RenderJobStatus;
+  priority: "high" | "low";
+  chunks_total: number | null;
+  chunks_done: number;
+  error: string | null;
+  requested_at: string;
+  claimed_at: string | null;
+  completed_at: string | null;
 };

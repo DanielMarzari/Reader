@@ -73,16 +73,12 @@ export function TTSPlayerBar() {
     seekFrac,
     cycleRate,
     setVoice,
-    engine,
   } = useTTS();
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   const [playingSampleId, setPlayingSampleId] = useState<string | null>(null);
   const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  const engineLabel = engine === "voice-studio" ? "Voice Studio" : "Browser";
-  const voiceTitle = selectedVoice?.name
-    ? `${engineLabel}: ${selectedVoice.name}`
-    : engineLabel;
+  const voiceTitle = selectedVoice?.name ?? "Browser voice";
 
   // Stop any sample preview when the picker closes.
   useEffect(() => {
@@ -143,13 +139,6 @@ export function TTSPlayerBar() {
             title={voiceTitle}
           >
             <VoiceAvatar voice={selectedVoice} size={36} />
-            {engine === "voice-studio" && (
-              <span
-                className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-[color:var(--accent)] border border-[color:var(--surface)]"
-                aria-hidden
-                title="Voice Studio engine (local)"
-              />
-            )}
           </button>
           {voicePickerOpen && (
             <div

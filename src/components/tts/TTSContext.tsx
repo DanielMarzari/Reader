@@ -1,5 +1,16 @@
 "use client";
 
+// Browser-engine TTS context.
+//
+// This is the fallback/baseline playback path — Web Speech API with the
+// browser's built-in voice. It's used when the user is reading a document
+// that has no pre-rendered audiobook yet (or one is still rendering).
+// When a ready audiobook exists for (doc, voice) pair, the reader page
+// mounts <AudiobookPlayer/> instead and this provider isn't used.
+//
+// No live streaming, no localhost calls, no external APIs — the browser
+// engine is our universal floor.
+
 import {
   createContext,
   useCallback,
@@ -16,21 +27,13 @@ import {
   type AutoSkipSettings,
 } from "@/lib/autoskip";
 import type { ReaderVoice } from "@/types/voice";
-import { chunkDocument, estimateWordIdx, type Chunk } from "@/lib/ttsChunker";
-import { TTSStreamer, type StreamerStatus } from "./TTSStreamer";
 
 const WORDS_PER_SECOND = 2.5;
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
 
 export type Status = "idle" | "playing" | "paused";
-/** Playback engine:
- *    "browser"       — the browser's Web Speech API (free, offline, default)
- *    "voice-studio"  — the user's locally-running Voice Studio backend
- *                      (F5-TTS or XTTS on their Mac). Requires ./start.sh
- *                      to be up at http://localhost:8000. */
-export type TTSEngine = "browser" | "voice-studio";
 
-type TTSContextValue = {
+export type TTSContextValue = {
   tokens: Tokenized;
   status: Status;
   currentWordIdx: number;
@@ -43,13 +46,6 @@ type TTSContextValue = {
   elapsedSec: number;
   totalSec: number;
   progressPct: number;
-
-  engine: TTSEngine;
-  setEngine: (engine: TTSEngine) => void;
-  /** True when http://localhost:8000/api/health responded OK on mount.
-   *  When false, the Voice Studio engine toggle is disabled. */
-  voiceStudioAvailable: boolean;
-  engineError: string | null;
 
   clickToListen: boolean;
 
@@ -64,7 +60,7 @@ type TTSContextValue = {
   jumpToWord: (wordIdx: number) => void;
 };
 
-const TTSContext = createContext<TTSContextValue | null>(null);
+export const TTSContext = createContext<TTSContextValue | null>(null);
 
 export function useTTS(): TTSContextValue {
   const ctx = useContext(TTSContext);
@@ -78,8 +74,6 @@ export function TTSProvider({
   initialCharIndex,
   initialRate,
   initialVoiceName,
-  initialEngine = "browser",
-  onEngineChange,
   clickToListen,
   autoSkip = defaultAutoSkip,
   children,
@@ -89,8 +83,6 @@ export function TTSProvider({
   initialCharIndex: number;
   initialRate: number;
   initialVoiceName: string | null;
-  initialEngine?: TTSEngine;
-  onEngineChange?: (engine: TTSEngine) => void;
   clickToListen: boolean;
   autoSkip?: AutoSkipSettings;
   children: React.ReactNode;
@@ -100,10 +92,10 @@ export function TTSProvider({
 
   const [status, setStatus] = useState<Status>("idle");
   const [rate, setRate] = useState(initialRate);
-  // voiceId is the id of a Voice Lab profile (/api/voices). initialVoiceName
-  // comes from the DB — it may be an old browser voice name from before we
-  // migrated; in that case we just ignore it and fall back to the first
-  // Voice Lab voice.
+  // voiceId is the id of a Voice Lab profile (/api/voices). It's stored and
+  // shown in the avatar for UI consistency, but doesn't actually affect the
+  // browser engine's timbre — the OS picks whatever Web Speech voice is
+  // default. Pre-rendered audiobooks are where cloned voices actually play.
   const [voiceId, setVoiceId] = useState<string | null>(initialVoiceName);
   const [voices, setVoices] = useState<ReaderVoice[]>([]);
   const [voicesLoading, setVoicesLoading] = useState(true);
@@ -111,18 +103,11 @@ export function TTSProvider({
     wordIndexAt(allWords, initialCharIndex)
   );
 
-  // Engine state — browser (default) vs user's local Voice Studio.
-  const [engine, setEngineState] = useState<TTSEngine>(initialEngine);
-  const [voiceStudioAvailable, setVoiceStudioAvailable] = useState(false);
-  const [engineError, setEngineError] = useState<string | null>(null);
-
   const utteranceBaseRef = useRef<number>(0);
   const manualStopRef = useRef(false);
   const savedIdxRef = useRef<number>(currentWordIdx);
   const clickToListenRef = useRef(clickToListen);
   const autoSkipRef = useRef<AutoSkipSettings>(autoSkip);
-  const streamerRef = useRef<TTSStreamer | null>(null);
-  const chunksRef = useRef<Chunk[]>([]);
   useEffect(() => {
     clickToListenRef.current = clickToListen;
   }, [clickToListen]);
@@ -131,8 +116,9 @@ export function TTSProvider({
   }, [autoSkip]);
 
   // Load Voice Lab voices from the server. Browser SpeechSynthesis voices
-  // are intentionally NOT surfaced — the app only exposes voices imported
-  // from Voice Studio.
+  // aren't surfaced — the app only exposes voices imported/cloned from
+  // Voice Studio. The selected voice is just a UI hint here; rendered
+  // audiobooks use it for actual synthesis.
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -145,8 +131,9 @@ export function TTSProvider({
         setVoices(list);
         setVoiceId((prev) => {
           if (prev && list.some((v) => v.id === prev || v.name === prev)) {
-            // Accept either id or legacy name as the persisted value.
-            const match = list.find((v) => v.id === prev) ?? list.find((v) => v.name === prev);
+            const match =
+              list.find((v) => v.id === prev) ??
+              list.find((v) => v.name === prev);
             return match?.id ?? null;
           }
           return list[0]?.id ?? null;
@@ -158,32 +145,6 @@ export function TTSProvider({
       }
     }
     load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Probe the user's local Voice Studio on mount. Hits
-  // http://localhost:8000/api/health — if that works, the engine toggle
-  // is enabled. Fails silently otherwise (browser engine is the default).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const ctrl = new AbortController();
-        const tid = setTimeout(() => ctrl.abort(), 2000);
-        const base =
-          (typeof process !== "undefined" &&
-            process.env?.NEXT_PUBLIC_VOICE_STUDIO_URL) ||
-          "http://localhost:8000";
-        const resp = await fetch(`${base}/api/health`, { signal: ctrl.signal });
-        clearTimeout(tid);
-        if (!resp.ok || cancelled) return;
-        setVoiceStudioAvailable(true);
-      } catch {
-        /* Voice Studio not running — silent. */
-      }
-    })();
     return () => {
       cancelled = true;
     };
@@ -206,7 +167,6 @@ export function TTSProvider({
       void fetch(`/api/documents/${docId}/position`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        // The server field is still called voiceName; we pass the voice id.
         body: JSON.stringify({ charIndex: w.start, rate, voiceName: voiceId }),
       });
     }, 4000);
@@ -218,8 +178,6 @@ export function TTSProvider({
     return () => {
       if (typeof window === "undefined") return;
       window.speechSynthesis.cancel();
-      streamerRef.current?.dispose();
-      streamerRef.current = null;
       const w = allWords[savedIdxRef.current];
       if (w) {
         navigator.sendBeacon?.(
@@ -233,9 +191,9 @@ export function TTSProvider({
     };
   }, [docId, allWords, rate, voiceId]);
 
-  // -------- Browser engine (Web Speech API) --------
+  // ---- Speech synthesis ----
 
-  const speakFromBrowser = useCallback(
+  const speakFrom = useCallback(
     (startWordIdx: number) => {
       if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
       const synth = window.speechSynthesis;
@@ -256,9 +214,6 @@ export function TTSProvider({
 
       const u = new SpeechSynthesisUtterance(tail);
       u.rate = rate;
-      // Until a real TTS engine (ElevenLabs/etc.) is wired, we still use
-      // the browser's SpeechSynthesis with its default system voice.
-      // The Voice Lab selection is stored but doesn't yet influence timbre.
       u.onboundary = (e: SpeechSynthesisEvent) => {
         if (e.name !== "word" && e.charLength === 0) return;
         const globalChar = utteranceBaseRef.current + e.charIndex;
@@ -282,131 +237,23 @@ export function TTSProvider({
     [allWords, content, rate]
   );
 
-  // -------- ElevenLabs engine (chunked streaming) --------
-
-  const teardownStreamer = useCallback(() => {
-    streamerRef.current?.dispose();
-    streamerRef.current = null;
-  }, []);
-
-  const handleStreamerStatus = useCallback(
-    (s: StreamerStatus, err?: string) => {
-      if (s === "error") {
-        setEngineError(err ?? "Streaming error");
-        setStatus("paused");
-        return;
-      }
-      if (s === "playing") setStatus("playing");
-      else if (s === "paused") setStatus("paused");
-      else if (s === "ended") setStatus("idle");
-    },
-    []
-  );
-
-  const handleStreamerTick = useCallback(
-    (chunkIdx: number, progress: number) => {
-      const chunk = chunksRef.current[chunkIdx];
-      if (!chunk) return;
-      const idx = estimateWordIdx(chunk, progress);
-      setCurrentWordIdx(idx);
-    },
-    []
-  );
-
-  const startVoiceStudioFrom = useCallback(
-    async (startWordIdx: number) => {
-      setEngineError(null);
-      teardownStreamer();
-      if (startWordIdx >= allWords.length) {
-        setStatus("idle");
-        return;
-      }
-      const startChar = allWords[startWordIdx]?.start ?? 0;
-      const chunks = chunkDocument(content, allWords, startChar);
-      if (chunks.length === 0) {
-        setStatus("idle");
-        return;
-      }
-      chunksRef.current = chunks;
-
-      const streamer = new TTSStreamer({
-        content,
-        chunks,
-        // Use the same voice id that powers the avatar / player bar — the
-        // Reader voice list is already synced from Voice Studio so the
-        // ids match on both sides.
-        voiceId: voiceId ?? undefined,
-        rate,
-        onStatusChange: handleStreamerStatus,
-        onTick: handleStreamerTick,
-      });
-      streamerRef.current = streamer;
-      setCurrentWordIdx(startWordIdx);
-      setStatus("playing");
-      try {
-        await streamer.start();
-      } catch (err) {
-        setEngineError(err instanceof Error ? err.message : "Streaming failed");
-        setStatus("paused");
-      }
-    },
-    [
-      allWords,
-      content,
-      voiceId,
-      handleStreamerStatus,
-      handleStreamerTick,
-      rate,
-      teardownStreamer,
-    ]
-  );
-
-  // -------- Unified engine dispatch --------
-
-  const speakFrom = useCallback(
-    (startWordIdx: number) => {
-      if (engine === "voice-studio") {
-        void startVoiceStudioFrom(startWordIdx);
-      } else {
-        speakFromBrowser(startWordIdx);
-      }
-    },
-    [engine, speakFromBrowser, startVoiceStudioFrom]
-  );
-
   const play = useCallback(() => {
     if (status === "playing") return;
-    if (engine === "voice-studio") {
-      if (status === "paused" && streamerRef.current) {
-        streamerRef.current.resume();
-        setStatus("playing");
-        return;
-      }
-      void startVoiceStudioFrom(currentWordIdx);
-      return;
-    }
     if (status === "paused" && window.speechSynthesis.paused) {
       window.speechSynthesis.resume();
       setStatus("playing");
       return;
     }
-    speakFromBrowser(currentWordIdx);
-  }, [status, engine, currentWordIdx, speakFromBrowser, startVoiceStudioFrom]);
+    speakFrom(currentWordIdx);
+  }, [status, currentWordIdx, speakFrom]);
 
   const pause = useCallback(() => {
     if (typeof window === "undefined") return;
-    if (engine === "voice-studio") {
-      if (status === "playing" && streamerRef.current) {
-        streamerRef.current.pause();
-        setStatus("paused");
-      }
-      return;
-    }
     if (status === "playing") {
       window.speechSynthesis.pause();
       setStatus("paused");
     }
-  }, [status, engine]);
+  }, [status]);
 
   const skip = useCallback(
     (seconds: number) => {
@@ -454,43 +301,21 @@ export function TTSProvider({
     const idx = SPEED_CYCLE.findIndex((x) => Math.abs(x - rate) < 0.01);
     const next = SPEED_CYCLE[(idx + 1) % SPEED_CYCLE.length];
     setRate(next);
-    if (engine === "voice-studio") {
-      streamerRef.current?.setRate(next);
-      return;
-    }
     if (status === "playing") {
       window.speechSynthesis.cancel();
-      setTimeout(() => speakFromBrowser(currentWordIdx), 30);
+      setTimeout(() => speakFrom(currentWordIdx), 30);
     }
-  }, [rate, status, engine, speakFromBrowser, currentWordIdx]);
+  }, [rate, status, speakFrom, currentWordIdx]);
 
   const setVoice = useCallback(
     (id: string) => {
       setVoiceId(id);
-      if (engine === "browser" && status === "playing") {
+      if (status === "playing") {
         window.speechSynthesis.cancel();
-        setTimeout(() => speakFromBrowser(currentWordIdx), 30);
+        setTimeout(() => speakFrom(currentWordIdx), 30);
       }
     },
-    [engine, status, speakFromBrowser, currentWordIdx]
-  );
-
-  const setEngine = useCallback(
-    (next: TTSEngine) => {
-      if (next === engine) return;
-      // Stop whatever is currently running.
-      if (engine === "browser") {
-        if (typeof window !== "undefined" && "speechSynthesis" in window) {
-          window.speechSynthesis.cancel();
-        }
-      } else {
-        teardownStreamer();
-      }
-      setStatus("idle");
-      setEngineState(next);
-      onEngineChange?.(next);
-    },
-    [engine, onEngineChange, teardownStreamer]
+    [status, speakFrom, currentWordIdx]
   );
 
   const jumpToWord = useCallback(
@@ -521,10 +346,6 @@ export function TTSProvider({
     elapsedSec,
     totalSec,
     progressPct,
-    engine,
-    setEngine,
-    voiceStudioAvailable,
-    engineError,
     clickToListen,
     play,
     pause,
