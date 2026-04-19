@@ -88,6 +88,54 @@ function ensureAllTables(db: Database.Database) {
   if (!vCols.some((c) => c.name === "cover_path")) {
     db.exec(`ALTER TABLE voice_profiles ADD COLUMN cover_path TEXT`);
   }
+
+  // Constraint migration: SQLite freezes CHECK constraints at CREATE time,
+  // so a DB created before we added 'uploaded' still enforces the old set
+  // and rejects imports with `CHECK constraint failed: kind IN
+  // ('cloned','designed')`. Detect that by inspecting the stored SQL and
+  // rebuild the table when the new kind value isn't in the expression.
+  const existingSql = (
+    db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='voice_profiles'`)
+      .get() as { sql?: string } | undefined
+  )?.sql ?? "";
+  if (existingSql && !existingSql.includes("'uploaded'")) {
+    db.exec("BEGIN");
+    try {
+      db.exec(`ALTER TABLE voice_profiles RENAME TO voice_profiles_old`);
+      db.exec(`
+        CREATE TABLE voice_profiles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('cloned','designed','uploaded')),
+          engine TEXT NOT NULL,
+          meta_json TEXT NOT NULL DEFAULT '{}',
+          sample_path TEXT,
+          cover_path TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      // Column set on the old table may or may not include cover_path
+      // (depends on how far along the previous migration got). Either way,
+      // these columns are present — cover_path defaults to NULL if absent.
+      const oldCols = db
+        .prepare(`PRAGMA table_info(voice_profiles_old)`)
+        .all() as Array<{ name: string }>;
+      const hasCover = oldCols.some((c) => c.name === "cover_path");
+      const selectCover = hasCover ? "cover_path" : "NULL AS cover_path";
+      db.exec(`
+        INSERT INTO voice_profiles
+          (id, name, kind, engine, meta_json, sample_path, cover_path, created_at)
+        SELECT id, name, kind, engine, meta_json, sample_path, ${selectCover}, created_at
+        FROM voice_profiles_old
+      `);
+      db.exec(`DROP TABLE voice_profiles_old`);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+  }
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_voice_profiles_created ON voice_profiles(created_at DESC)`
   );
