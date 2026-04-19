@@ -16,11 +16,20 @@ import {
   type AutoSkipSettings,
 } from "@/lib/autoskip";
 import type { ReaderVoice } from "@/types/voice";
+import { chunkDocument, estimateWordIdx, type Chunk } from "@/lib/ttsChunker";
+import { TTSStreamer, type StreamerStatus } from "./TTSStreamer";
 
 const WORDS_PER_SECOND = 2.5;
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
 
 export type Status = "idle" | "playing" | "paused";
+export type TTSEngine = "browser" | "elevenlabs";
+
+export type ElevenLabsVoice = {
+  id: string;
+  name: string;
+  labels?: Record<string, string>;
+};
 
 type TTSContextValue = {
   tokens: Tokenized;
@@ -35,6 +44,14 @@ type TTSContextValue = {
   elapsedSec: number;
   totalSec: number;
   progressPct: number;
+
+  engine: TTSEngine;
+  setEngine: (engine: TTSEngine) => void;
+  elevenLabsAvailable: boolean;
+  elevenLabsVoices: ElevenLabsVoice[];
+  elevenLabsVoiceId: string | null;
+  setElevenLabsVoiceId: (id: string) => void;
+  engineError: string | null;
 
   clickToListen: boolean;
 
@@ -63,6 +80,10 @@ export function TTSProvider({
   initialCharIndex,
   initialRate,
   initialVoiceName,
+  initialEngine = "browser",
+  initialElevenLabsVoiceId = null,
+  onEngineChange,
+  onElevenLabsVoiceChange,
   clickToListen,
   autoSkip = defaultAutoSkip,
   children,
@@ -72,6 +93,10 @@ export function TTSProvider({
   initialCharIndex: number;
   initialRate: number;
   initialVoiceName: string | null;
+  initialEngine?: TTSEngine;
+  initialElevenLabsVoiceId?: string | null;
+  onEngineChange?: (engine: TTSEngine) => void;
+  onElevenLabsVoiceChange?: (voiceId: string | null) => void;
   clickToListen: boolean;
   autoSkip?: AutoSkipSettings;
   children: React.ReactNode;
@@ -92,11 +117,22 @@ export function TTSProvider({
     wordIndexAt(allWords, initialCharIndex)
   );
 
+  // ElevenLabs engine state.
+  const [engine, setEngineState] = useState<TTSEngine>(initialEngine);
+  const [elevenLabsAvailable, setElevenLabsAvailable] = useState(false);
+  const [elevenLabsVoices, setElevenLabsVoices] = useState<ElevenLabsVoice[]>([]);
+  const [elevenLabsVoiceId, setElevenLabsVoiceIdState] = useState<string | null>(
+    initialElevenLabsVoiceId
+  );
+  const [engineError, setEngineError] = useState<string | null>(null);
+
   const utteranceBaseRef = useRef<number>(0);
   const manualStopRef = useRef(false);
   const savedIdxRef = useRef<number>(currentWordIdx);
   const clickToListenRef = useRef(clickToListen);
   const autoSkipRef = useRef<AutoSkipSettings>(autoSkip);
+  const streamerRef = useRef<TTSStreamer | null>(null);
+  const chunksRef = useRef<Chunk[]>([]);
   useEffect(() => {
     clickToListenRef.current = clickToListen;
   }, [clickToListen]);
@@ -137,6 +173,31 @@ export function TTSProvider({
     };
   }, []);
 
+  // Probe ElevenLabs availability once on mount.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch("/api/tts/voices");
+        if (!resp.ok) return;
+        const data = (await resp.json()) as {
+          enabled?: boolean;
+          voices?: ElevenLabsVoice[];
+        };
+        if (cancelled) return;
+        setElevenLabsAvailable(Boolean(data.enabled));
+        const list = data.voices ?? [];
+        setElevenLabsVoices(list);
+        setElevenLabsVoiceIdState((prev) => prev ?? list[0]?.id ?? null);
+      } catch {
+        /* silent */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const selectedVoice = useMemo(
     () => voices.find((v) => v.id === voiceId) ?? null,
     [voices, voiceId]
@@ -166,6 +227,8 @@ export function TTSProvider({
     return () => {
       if (typeof window === "undefined") return;
       window.speechSynthesis.cancel();
+      streamerRef.current?.dispose();
+      streamerRef.current = null;
       const w = allWords[savedIdxRef.current];
       if (w) {
         navigator.sendBeacon?.(
@@ -179,7 +242,9 @@ export function TTSProvider({
     };
   }, [docId, allWords, rate, voiceId]);
 
-  const speakFrom = useCallback(
+  // -------- Browser engine (Web Speech API) --------
+
+  const speakFromBrowser = useCallback(
     (startWordIdx: number) => {
       if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
       const synth = window.speechSynthesis;
@@ -226,23 +291,128 @@ export function TTSProvider({
     [allWords, content, rate]
   );
 
+  // -------- ElevenLabs engine (chunked streaming) --------
+
+  const teardownStreamer = useCallback(() => {
+    streamerRef.current?.dispose();
+    streamerRef.current = null;
+  }, []);
+
+  const handleStreamerStatus = useCallback(
+    (s: StreamerStatus, err?: string) => {
+      if (s === "error") {
+        setEngineError(err ?? "Streaming error");
+        setStatus("paused");
+        return;
+      }
+      if (s === "playing") setStatus("playing");
+      else if (s === "paused") setStatus("paused");
+      else if (s === "ended") setStatus("idle");
+    },
+    []
+  );
+
+  const handleStreamerTick = useCallback(
+    (chunkIdx: number, progress: number) => {
+      const chunk = chunksRef.current[chunkIdx];
+      if (!chunk) return;
+      const idx = estimateWordIdx(chunk, progress);
+      setCurrentWordIdx(idx);
+    },
+    []
+  );
+
+  const startElevenLabsFrom = useCallback(
+    async (startWordIdx: number) => {
+      setEngineError(null);
+      teardownStreamer();
+      if (startWordIdx >= allWords.length) {
+        setStatus("idle");
+        return;
+      }
+      const startChar = allWords[startWordIdx]?.start ?? 0;
+      const chunks = chunkDocument(content, allWords, startChar);
+      if (chunks.length === 0) {
+        setStatus("idle");
+        return;
+      }
+      chunksRef.current = chunks;
+
+      const streamer = new TTSStreamer({
+        content,
+        chunks,
+        voiceId: elevenLabsVoiceId ?? undefined,
+        rate,
+        onStatusChange: handleStreamerStatus,
+        onTick: handleStreamerTick,
+      });
+      streamerRef.current = streamer;
+      setCurrentWordIdx(startWordIdx);
+      setStatus("playing");
+      try {
+        await streamer.start();
+      } catch (err) {
+        setEngineError(err instanceof Error ? err.message : "Streaming failed");
+        setStatus("paused");
+      }
+    },
+    [
+      allWords,
+      content,
+      elevenLabsVoiceId,
+      handleStreamerStatus,
+      handleStreamerTick,
+      rate,
+      teardownStreamer,
+    ]
+  );
+
+  // -------- Unified engine dispatch --------
+
+  const speakFrom = useCallback(
+    (startWordIdx: number) => {
+      if (engine === "elevenlabs") {
+        void startElevenLabsFrom(startWordIdx);
+      } else {
+        speakFromBrowser(startWordIdx);
+      }
+    },
+    [engine, speakFromBrowser, startElevenLabsFrom]
+  );
+
   const play = useCallback(() => {
     if (status === "playing") return;
+    if (engine === "elevenlabs") {
+      if (status === "paused" && streamerRef.current) {
+        streamerRef.current.resume();
+        setStatus("playing");
+        return;
+      }
+      void startElevenLabsFrom(currentWordIdx);
+      return;
+    }
     if (status === "paused" && window.speechSynthesis.paused) {
       window.speechSynthesis.resume();
       setStatus("playing");
       return;
     }
-    speakFrom(currentWordIdx);
-  }, [status, currentWordIdx, speakFrom]);
+    speakFromBrowser(currentWordIdx);
+  }, [status, engine, currentWordIdx, speakFromBrowser, startElevenLabsFrom]);
 
   const pause = useCallback(() => {
     if (typeof window === "undefined") return;
+    if (engine === "elevenlabs") {
+      if (status === "playing" && streamerRef.current) {
+        streamerRef.current.pause();
+        setStatus("paused");
+      }
+      return;
+    }
     if (status === "playing") {
       window.speechSynthesis.pause();
       setStatus("paused");
     }
-  }, [status]);
+  }, [status, engine]);
 
   const skip = useCallback(
     (seconds: number) => {
@@ -290,21 +460,54 @@ export function TTSProvider({
     const idx = SPEED_CYCLE.findIndex((x) => Math.abs(x - rate) < 0.01);
     const next = SPEED_CYCLE[(idx + 1) % SPEED_CYCLE.length];
     setRate(next);
+    if (engine === "elevenlabs") {
+      streamerRef.current?.setRate(next);
+      return;
+    }
     if (status === "playing") {
       window.speechSynthesis.cancel();
-      setTimeout(() => speakFrom(currentWordIdx), 30);
+      setTimeout(() => speakFromBrowser(currentWordIdx), 30);
     }
-  }, [rate, status, speakFrom, currentWordIdx]);
+  }, [rate, status, engine, speakFromBrowser, currentWordIdx]);
 
   const setVoice = useCallback(
     (id: string) => {
       setVoiceId(id);
-      if (status === "playing") {
+      if (engine === "browser" && status === "playing") {
         window.speechSynthesis.cancel();
-        setTimeout(() => speakFrom(currentWordIdx), 30);
+        setTimeout(() => speakFromBrowser(currentWordIdx), 30);
       }
     },
-    [status, speakFrom, currentWordIdx]
+    [engine, status, speakFromBrowser, currentWordIdx]
+  );
+
+  const setEngine = useCallback(
+    (next: TTSEngine) => {
+      if (next === engine) return;
+      // Stop whatever is currently running.
+      if (engine === "browser") {
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
+      } else {
+        teardownStreamer();
+      }
+      setStatus("idle");
+      setEngineState(next);
+      onEngineChange?.(next);
+    },
+    [engine, onEngineChange, teardownStreamer]
+  );
+
+  const setElevenLabsVoiceId = useCallback(
+    (id: string) => {
+      setElevenLabsVoiceIdState(id);
+      onElevenLabsVoiceChange?.(id);
+      if (engine === "elevenlabs" && status === "playing") {
+        void startElevenLabsFrom(currentWordIdx);
+      }
+    },
+    [engine, status, currentWordIdx, onElevenLabsVoiceChange, startElevenLabsFrom]
   );
 
   const jumpToWord = useCallback(
@@ -335,6 +538,13 @@ export function TTSProvider({
     elapsedSec,
     totalSec,
     progressPct,
+    engine,
+    setEngine,
+    elevenLabsAvailable,
+    elevenLabsVoices,
+    elevenLabsVoiceId,
+    setElevenLabsVoiceId,
+    engineError,
     clickToListen,
     play,
     pause,

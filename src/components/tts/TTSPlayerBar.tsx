@@ -73,10 +73,20 @@ export function TTSPlayerBar() {
     seekFrac,
     cycleRate,
     setVoice,
+    engine,
+    elevenLabsVoices,
+    elevenLabsVoiceId,
   } = useTTS();
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   const [playingSampleId, setPlayingSampleId] = useState<string | null>(null);
   const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const elVoiceName = elevenLabsVoices.find((v) => v.id === elevenLabsVoiceId)?.name;
+  const engineLabel = engine === "elevenlabs" ? "ElevenLabs" : "Voice Lab";
+  const voiceTitle =
+    engine === "elevenlabs"
+      ? `ElevenLabs${elVoiceName ? `: ${elVoiceName}` : ""}`
+      : selectedVoice?.name || "Voice";
 
   // Stop any sample preview when the picker closes.
   useEffect(() => {
@@ -131,14 +141,21 @@ export function TTSPlayerBar() {
       <div className="player-row">
         <div className="relative">
           <button
-            className="player-voice"
+            className="player-voice relative"
             onClick={() => setVoicePickerOpen((x) => !x)}
             aria-label="Change voice"
-            title={selectedVoice?.name || "Voice"}
+            title={voiceTitle}
           >
             <VoiceAvatar voice={selectedVoice} size={36} />
+            {engine === "elevenlabs" && (
+              <span
+                className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-[color:var(--accent)] border border-[color:var(--surface)]"
+                aria-hidden
+                title="ElevenLabs engine"
+              />
+            )}
           </button>
-          {voicePickerOpen && (
+          {voicePickerOpen && engine === "browser" && (
             <div
               className="absolute bottom-12 left-0 bg-[color:var(--surface)] border border-[color:var(--border)] rounded-lg shadow-lg max-h-72 overflow-y-auto z-10 min-w-[260px]"
             >
@@ -217,6 +234,20 @@ export function TTSPlayerBar() {
                   </div>
                 ))
               )}
+            </div>
+          )}
+          {voicePickerOpen && engine === "elevenlabs" && (
+            <div
+              className="absolute bottom-12 left-0 bg-[color:var(--surface)] border border-[color:var(--border)] rounded-lg shadow-lg z-10 min-w-[260px]"
+            >
+              <div className="px-3 py-2 border-b border-[color:var(--border)] flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[color:var(--muted)]">
+                  {engineLabel}
+                </span>
+              </div>
+              <div className="px-3 py-3 text-xs text-[color:var(--muted)]">
+                Open Settings to change voices or switch engines.
+              </div>
             </div>
           )}
         </div>

@@ -69,6 +69,18 @@ export function ReaderClient({
       initialCharIndex={initialCharIndex}
       initialRate={initialRate}
       initialVoiceName={initialVoiceName}
+      initialEngine={settings.ttsEngine}
+      initialElevenLabsVoiceId={settings.elevenLabsVoiceId}
+      onEngineChange={(engine) => {
+        const next = { ...settings, ttsEngine: engine };
+        setSettings(next);
+        saveSettings(next);
+      }}
+      onElevenLabsVoiceChange={(voiceId) => {
+        const next = { ...settings, elevenLabsVoiceId: voiceId };
+        setSettings(next);
+        saveSettings(next);
+      }}
       clickToListen={settings.clickToListen}
       autoSkip={settings.autoSkip}
     >
