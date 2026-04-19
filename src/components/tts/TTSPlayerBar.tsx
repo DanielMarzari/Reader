@@ -1,7 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useTTS } from "./TTSContext";
+import type { ReaderVoice } from "@/types/voice";
 
 function fmtTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) seconds = 0;
@@ -14,12 +16,54 @@ function fmtTime(seconds: number): string {
     : `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function avatarGradient(v: ReaderVoice | null): string {
+  const cols = (v?.design?.colors ?? []).filter(
+    (c): c is string => typeof c === "string"
+  );
+  if (cols.length === 0) return "linear-gradient(135deg, #2f43fa, #818cf8)";
+  if (cols.length === 1) return cols[0];
+  return `conic-gradient(from 210deg, ${cols.join(", ")}, ${cols[0]})`;
+}
+
+function VoiceAvatar({
+  voice,
+  size = 36,
+}: {
+  voice: ReaderVoice | null;
+  size?: number;
+}) {
+  const initial = voice?.name?.trim().charAt(0).toUpperCase() || "V";
+  return (
+    <span
+      className="player-voice-avatar"
+      style={{
+        width: size,
+        height: size,
+        background: avatarGradient(voice),
+      }}
+    >
+      <span
+        style={{
+          color: "white",
+          fontWeight: 700,
+          fontSize: size * 0.42,
+          textShadow: "0 1px 2px rgba(0,0,0,0.35)",
+        }}
+      >
+        {initial}
+      </span>
+    </span>
+  );
+}
+
 export function TTSPlayerBar() {
   const {
     status,
     rate,
-    voiceName,
+    voiceId,
+    selectedVoice,
     voices,
+    voicesLoading,
     elapsedSec,
     totalSec,
     progressPct,
@@ -31,7 +75,43 @@ export function TTSPlayerBar() {
     setVoice,
   } = useTTS();
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
-  const voiceInitial = voiceName?.charAt(0).toUpperCase() || "V";
+  const [playingSampleId, setPlayingSampleId] = useState<string | null>(null);
+  const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Stop any sample preview when the picker closes.
+  useEffect(() => {
+    if (!voicePickerOpen && sampleAudioRef.current) {
+      sampleAudioRef.current.pause();
+      sampleAudioRef.current = null;
+      setPlayingSampleId(null);
+    }
+  }, [voicePickerOpen]);
+
+  function toggleSample(v: ReaderVoice) {
+    if (playingSampleId === v.id && sampleAudioRef.current) {
+      sampleAudioRef.current.pause();
+      sampleAudioRef.current = null;
+      setPlayingSampleId(null);
+      return;
+    }
+    if (sampleAudioRef.current) {
+      sampleAudioRef.current.pause();
+    }
+    const audio = new Audio(`/api/voices/${v.id}/sample`);
+    audio.onended = () => {
+      if (sampleAudioRef.current === audio) {
+        sampleAudioRef.current = null;
+        setPlayingSampleId(null);
+      }
+    };
+    audio.onerror = () => {
+      setPlayingSampleId(null);
+      sampleAudioRef.current = null;
+    };
+    sampleAudioRef.current = audio;
+    setPlayingSampleId(v.id);
+    void audio.play().catch(() => setPlayingSampleId(null));
+  }
 
   return (
     <div className="player">
@@ -54,33 +134,87 @@ export function TTSPlayerBar() {
             className="player-voice"
             onClick={() => setVoicePickerOpen((x) => !x)}
             aria-label="Change voice"
-            title={voiceName || "Voice"}
+            title={selectedVoice?.name || "Voice"}
           >
-            {voiceInitial}
+            <VoiceAvatar voice={selectedVoice} size={36} />
           </button>
           {voicePickerOpen && (
             <div
-              className="absolute bottom-12 left-0 bg-[color:var(--surface)] border border-[color:var(--border)] rounded-lg shadow-lg max-h-64 overflow-y-auto z-10 min-w-[220px]"
-              onMouseLeave={() => setVoicePickerOpen(false)}
+              className="absolute bottom-12 left-0 bg-[color:var(--surface)] border border-[color:var(--border)] rounded-lg shadow-lg max-h-72 overflow-y-auto z-10 min-w-[260px]"
             >
-              {voices.length === 0 ? (
-                <div className="px-3 py-2 text-xs text-[color:var(--muted)]">
-                  No voices available
+              <div className="px-3 py-2 border-b border-[color:var(--border)] flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[color:var(--muted)]">
+                  Voice
+                </span>
+                <Link
+                  href="/voice-lab"
+                  className="text-xs text-[color:var(--accent)] hover:underline"
+                >
+                  Voice Lab →
+                </Link>
+              </div>
+              {voicesLoading ? (
+                <div className="px-3 py-4 text-xs text-[color:var(--muted)]">
+                  Loading voices…
+                </div>
+              ) : voices.length === 0 ? (
+                <div className="px-3 py-4 text-xs text-[color:var(--muted)]">
+                  No voices imported yet. Create one in Voice Studio and it
+                  will appear here.
                 </div>
               ) : (
                 voices.map((v) => (
-                  <button
-                    key={v.name}
-                    onClick={() => {
-                      setVoice(v.name);
-                      setVoicePickerOpen(false);
-                    }}
-                    className={`block w-full text-left px-3 py-1.5 text-xs hover:bg-[color:var(--surface-2)] ${
-                      v.name === voiceName ? "font-semibold text-[color:var(--accent)]" : ""
+                  <div
+                    key={v.id}
+                    className={`flex items-center gap-2 px-2 py-2 text-sm hover:bg-[color:var(--surface-2)] ${
+                      v.id === voiceId ? "bg-[color:var(--surface-2)]" : ""
                     }`}
                   >
-                    {v.name} <span className="text-[color:var(--muted)]">({v.lang})</span>
-                  </button>
+                    <button
+                      onClick={() => {
+                        setVoice(v.id);
+                      }}
+                      className="flex items-center gap-2 flex-1 text-left min-w-0"
+                    >
+                      <VoiceAvatar voice={v} size={28} />
+                      <span className="min-w-0 flex-1">
+                        <span
+                          className={`block truncate ${
+                            v.id === voiceId
+                              ? "font-semibold text-[color:var(--accent)]"
+                              : ""
+                          }`}
+                        >
+                          {v.name}
+                        </span>
+                        {v.design?.description ? (
+                          <span className="block text-[11px] text-[color:var(--muted)] truncate">
+                            {v.design.description as string}
+                          </span>
+                        ) : null}
+                      </span>
+                    </button>
+                    {v.hasSample && (
+                      <button
+                        onClick={() => toggleSample(v)}
+                        className="btn-ghost"
+                        title={playingSampleId === v.id ? "Stop preview" : "Preview"}
+                        aria-label={playingSampleId === v.id ? "Stop preview" : "Preview"}
+                        style={{ padding: 4 }}
+                      >
+                        {playingSampleId === v.id ? (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="6" y="5" width="4" height="14" rx="1" />
+                            <rect x="14" y="5" width="4" height="14" rx="1" />
+                          </svg>
+                        ) : (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 4 L20 12 L6 20 Z" />
+                          </svg>
+                        )}
+                      </button>
+                    )}
+                  </div>
                 ))
               )}
             </div>

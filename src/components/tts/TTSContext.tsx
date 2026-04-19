@@ -15,6 +15,7 @@ import {
   preprocessForSpeech,
   type AutoSkipSettings,
 } from "@/lib/autoskip";
+import type { ReaderVoice } from "@/types/voice";
 
 const WORDS_PER_SECOND = 2.5;
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
@@ -27,8 +28,10 @@ type TTSContextValue = {
   currentWordIdx: number;
   currentSentenceIdx: number;
   rate: number;
-  voiceName: string | null;
-  voices: SpeechSynthesisVoice[];
+  voiceId: string | null;
+  selectedVoice: ReaderVoice | null;
+  voices: ReaderVoice[];
+  voicesLoading: boolean;
   elapsedSec: number;
   totalSec: number;
   progressPct: number;
@@ -42,7 +45,7 @@ type TTSContextValue = {
   seekToCharOffset: (charOffset: number, play?: boolean) => void;
   seekFrac: (frac: number) => void;
   cycleRate: () => void;
-  setVoice: (name: string) => void;
+  setVoice: (id: string) => void;
   jumpToWord: (wordIdx: number) => void;
 };
 
@@ -78,8 +81,13 @@ export function TTSProvider({
 
   const [status, setStatus] = useState<Status>("idle");
   const [rate, setRate] = useState(initialRate);
-  const [voiceName, setVoiceName] = useState<string | null>(initialVoiceName);
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  // voiceId is the id of a Voice Lab profile (/api/voices). initialVoiceName
+  // comes from the DB — it may be an old browser voice name from before we
+  // migrated; in that case we just ignore it and fall back to the first
+  // Voice Lab voice.
+  const [voiceId, setVoiceId] = useState<string | null>(initialVoiceName);
+  const [voices, setVoices] = useState<ReaderVoice[]>([]);
+  const [voicesLoading, setVoicesLoading] = useState(true);
   const [currentWordIdx, setCurrentWordIdx] = useState<number>(() =>
     wordIndexAt(allWords, initialCharIndex)
   );
@@ -96,26 +104,42 @@ export function TTSProvider({
     autoSkipRef.current = autoSkip;
   }, [autoSkip]);
 
-  // Load voices.
+  // Load Voice Lab voices from the server. Browser SpeechSynthesis voices
+  // are intentionally NOT surfaced — the app only exposes voices imported
+  // from Voice Studio.
   useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    const load = () => {
-      const list = window.speechSynthesis.getVoices();
-      setVoices(list);
-      setVoiceName((prev) => {
-        if (prev) return prev;
-        const en = list.find((v) => v.lang.startsWith("en"));
-        return en?.name ?? list[0]?.name ?? null;
-      });
-    };
+    let cancelled = false;
+    async function load() {
+      try {
+        const res = await fetch("/api/voices");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = (await res.json()) as { voices: ReaderVoice[] };
+        if (cancelled) return;
+        const list = json.voices ?? [];
+        setVoices(list);
+        setVoiceId((prev) => {
+          if (prev && list.some((v) => v.id === prev || v.name === prev)) {
+            // Accept either id or legacy name as the persisted value.
+            const match = list.find((v) => v.id === prev) ?? list.find((v) => v.name === prev);
+            return match?.id ?? null;
+          }
+          return list[0]?.id ?? null;
+        });
+      } catch (err) {
+        console.warn("Failed to load Voice Lab voices:", err);
+      } finally {
+        if (!cancelled) setVoicesLoading(false);
+      }
+    }
     load();
-    window.speechSynthesis.addEventListener("voiceschanged", load);
-    return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const selectedVoice = useMemo(
-    () => voices.find((v) => v.name === voiceName) ?? null,
-    [voices, voiceName]
+    () => voices.find((v) => v.id === voiceId) ?? null,
+    [voices, voiceId]
   );
 
   useEffect(() => {
@@ -130,11 +154,12 @@ export function TTSProvider({
       void fetch(`/api/documents/${docId}/position`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ charIndex: w.start, rate, voiceName }),
+        // The server field is still called voiceName; we pass the voice id.
+        body: JSON.stringify({ charIndex: w.start, rate, voiceName: voiceId }),
       });
     }, 4000);
     return () => clearInterval(handle);
-  }, [docId, rate, voiceName, allWords]);
+  }, [docId, rate, voiceId, allWords]);
 
   // Save on unmount.
   useEffect(() => {
@@ -146,13 +171,13 @@ export function TTSProvider({
         navigator.sendBeacon?.(
           `/api/documents/${docId}/position`,
           new Blob(
-            [JSON.stringify({ charIndex: w.start, rate, voiceName })],
+            [JSON.stringify({ charIndex: w.start, rate, voiceName: voiceId })],
             { type: "application/json" }
           )
         );
       }
     };
-  }, [docId, allWords, rate, voiceName]);
+  }, [docId, allWords, rate, voiceId]);
 
   const speakFrom = useCallback(
     (startWordIdx: number) => {
@@ -175,7 +200,9 @@ export function TTSProvider({
 
       const u = new SpeechSynthesisUtterance(tail);
       u.rate = rate;
-      if (selectedVoice) u.voice = selectedVoice;
+      // Until a real TTS engine (ElevenLabs/etc.) is wired, we still use
+      // the browser's SpeechSynthesis with its default system voice.
+      // The Voice Lab selection is stored but doesn't yet influence timbre.
       u.onboundary = (e: SpeechSynthesisEvent) => {
         if (e.name !== "word" && e.charLength === 0) return;
         const globalChar = utteranceBaseRef.current + e.charIndex;
@@ -196,7 +223,7 @@ export function TTSProvider({
       synth.speak(u);
       setStatus("playing");
     },
-    [allWords, content, rate, selectedVoice]
+    [allWords, content, rate]
   );
 
   const play = useCallback(() => {
@@ -270,8 +297,8 @@ export function TTSProvider({
   }, [rate, status, speakFrom, currentWordIdx]);
 
   const setVoice = useCallback(
-    (name: string) => {
-      setVoiceName(name);
+    (id: string) => {
+      setVoiceId(id);
       if (status === "playing") {
         window.speechSynthesis.cancel();
         setTimeout(() => speakFrom(currentWordIdx), 30);
@@ -301,8 +328,10 @@ export function TTSProvider({
     currentWordIdx,
     currentSentenceIdx,
     rate,
-    voiceName,
+    voiceId,
+    selectedVoice,
     voices,
+    voicesLoading,
     elapsedSec,
     totalSec,
     progressPct,
