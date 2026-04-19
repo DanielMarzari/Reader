@@ -1,4 +1,7 @@
-// Chunked streaming TTS orchestrator.
+// Chunked streaming TTS orchestrator — targets the user's locally-running
+// Voice Studio backend (F5-TTS or XTTS-v2 behind the curtain). Nothing
+// leaves the user's machine; if Voice Studio isn't running, this engine
+// is unavailable and the UI falls back to the browser's Web Speech API.
 //
 // Responsibilities:
 //   - Accept an ordered list of text Chunks from `ttsChunker.ts`.
@@ -24,8 +27,14 @@ export type StreamerStatus = "idle" | "loading" | "playing" | "paused" | "ended"
 export type StreamerOptions = {
   content: string;
   chunks: Chunk[];
+  /** Voice profile id as it exists in Voice Studio (same id shared with
+   *  Reader's /api/voices list). Required; if missing the streamer errors
+   *  immediately with a clear message. */
   voiceId?: string;
-  modelId?: string;
+  /** Base URL for the Voice Studio backend. Defaults to
+   *  http://localhost:8000 (the user's own Mac). Override via
+   *  NEXT_PUBLIC_VOICE_STUDIO_URL for dev setups. */
+  baseUrl?: string;
   rate: number;
   startChunkIndex?: number;
   onStatusChange?: (status: StreamerStatus, error?: string) => void;
@@ -33,6 +42,11 @@ export type StreamerOptions = {
   onChunkStart?: (chunkIndex: number) => void;
   onEnded?: () => void;
 };
+
+/** Default Voice Studio endpoint — the user's own Mac running ./start.sh. */
+export const DEFAULT_VOICE_STUDIO_URL =
+  (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_VOICE_STUDIO_URL) ||
+  "http://localhost:8000";
 
 type ChunkState = {
   index: number;
@@ -380,17 +394,31 @@ export class TTSStreamer {
     const ac = new AbortController();
     this.abortControllers.set(chunkIndex, ac);
 
+    if (!this.opts.voiceId) {
+      this.setStatus(
+        "error",
+        "Pick a voice in settings before using Voice Studio read-aloud."
+      );
+      state.fetching = false;
+      return;
+    }
+
+    const base = (this.opts.baseUrl || DEFAULT_VOICE_STUDIO_URL).replace(/\/+$/, "");
     try {
-      const resp = await fetch("/api/tts", {
+      const resp = await fetch(`${base}/api/synthesize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: ac.signal,
         body: JSON.stringify({
+          voice_id: this.opts.voiceId,
           text: chunk.speakText,
-          previousText: previousContext(this.opts.content, chunk),
-          nextText: forwardContext(this.opts.chunks, chunkIndex),
-          voiceId: this.opts.voiceId,
-          modelId: this.opts.modelId,
+          // Context hints are accepted server-side but currently informational
+          // (F5/XTTS don't expose prev/next fields the way ElevenLabs did).
+          // Keeping them in the payload so future smoothing tricks have data.
+          previous_text: previousContext(this.opts.content, chunk),
+          next_text: forwardContext(this.opts.chunks, chunkIndex),
+          speed: this.opts.rate,
+          language: "en",
         }),
       });
 
@@ -398,7 +426,9 @@ export class TTSStreamer {
         const msg = await resp.text().catch(() => resp.statusText);
         this.setStatus(
           "error",
-          `/api/tts ${resp.status}: ${msg.slice(0, 200)}`
+          resp.status === 0 || /Failed to fetch|NetworkError/i.test(msg)
+            ? "Voice Studio isn't running. Start it on your Mac (./start.sh)."
+            : `Voice Studio ${resp.status}: ${msg.slice(0, 200)}`
         );
         return;
       }

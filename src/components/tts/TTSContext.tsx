@@ -23,13 +23,12 @@ const WORDS_PER_SECOND = 2.5;
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
 
 export type Status = "idle" | "playing" | "paused";
-export type TTSEngine = "browser" | "elevenlabs";
-
-export type ElevenLabsVoice = {
-  id: string;
-  name: string;
-  labels?: Record<string, string>;
-};
+/** Playback engine:
+ *    "browser"       — the browser's Web Speech API (free, offline, default)
+ *    "voice-studio"  — the user's locally-running Voice Studio backend
+ *                      (F5-TTS or XTTS on their Mac). Requires ./start.sh
+ *                      to be up at http://localhost:8000. */
+export type TTSEngine = "browser" | "voice-studio";
 
 type TTSContextValue = {
   tokens: Tokenized;
@@ -47,10 +46,9 @@ type TTSContextValue = {
 
   engine: TTSEngine;
   setEngine: (engine: TTSEngine) => void;
-  elevenLabsAvailable: boolean;
-  elevenLabsVoices: ElevenLabsVoice[];
-  elevenLabsVoiceId: string | null;
-  setElevenLabsVoiceId: (id: string) => void;
+  /** True when http://localhost:8000/api/health responded OK on mount.
+   *  When false, the Voice Studio engine toggle is disabled. */
+  voiceStudioAvailable: boolean;
   engineError: string | null;
 
   clickToListen: boolean;
@@ -81,9 +79,7 @@ export function TTSProvider({
   initialRate,
   initialVoiceName,
   initialEngine = "browser",
-  initialElevenLabsVoiceId = null,
   onEngineChange,
-  onElevenLabsVoiceChange,
   clickToListen,
   autoSkip = defaultAutoSkip,
   children,
@@ -94,9 +90,7 @@ export function TTSProvider({
   initialRate: number;
   initialVoiceName: string | null;
   initialEngine?: TTSEngine;
-  initialElevenLabsVoiceId?: string | null;
   onEngineChange?: (engine: TTSEngine) => void;
-  onElevenLabsVoiceChange?: (voiceId: string | null) => void;
   clickToListen: boolean;
   autoSkip?: AutoSkipSettings;
   children: React.ReactNode;
@@ -117,13 +111,9 @@ export function TTSProvider({
     wordIndexAt(allWords, initialCharIndex)
   );
 
-  // ElevenLabs engine state.
+  // Engine state — browser (default) vs user's local Voice Studio.
   const [engine, setEngineState] = useState<TTSEngine>(initialEngine);
-  const [elevenLabsAvailable, setElevenLabsAvailable] = useState(false);
-  const [elevenLabsVoices, setElevenLabsVoices] = useState<ElevenLabsVoice[]>([]);
-  const [elevenLabsVoiceId, setElevenLabsVoiceIdState] = useState<string | null>(
-    initialElevenLabsVoiceId
-  );
+  const [voiceStudioAvailable, setVoiceStudioAvailable] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
 
   const utteranceBaseRef = useRef<number>(0);
@@ -173,24 +163,25 @@ export function TTSProvider({
     };
   }, []);
 
-  // Probe ElevenLabs availability once on mount.
+  // Probe the user's local Voice Studio on mount. Hits
+  // http://localhost:8000/api/health — if that works, the engine toggle
+  // is enabled. Fails silently otherwise (browser engine is the default).
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const resp = await fetch("/api/tts/voices");
-        if (!resp.ok) return;
-        const data = (await resp.json()) as {
-          enabled?: boolean;
-          voices?: ElevenLabsVoice[];
-        };
-        if (cancelled) return;
-        setElevenLabsAvailable(Boolean(data.enabled));
-        const list = data.voices ?? [];
-        setElevenLabsVoices(list);
-        setElevenLabsVoiceIdState((prev) => prev ?? list[0]?.id ?? null);
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 2000);
+        const base =
+          (typeof process !== "undefined" &&
+            process.env?.NEXT_PUBLIC_VOICE_STUDIO_URL) ||
+          "http://localhost:8000";
+        const resp = await fetch(`${base}/api/health`, { signal: ctrl.signal });
+        clearTimeout(tid);
+        if (!resp.ok || cancelled) return;
+        setVoiceStudioAvailable(true);
       } catch {
-        /* silent */
+        /* Voice Studio not running — silent. */
       }
     })();
     return () => {
@@ -322,7 +313,7 @@ export function TTSProvider({
     []
   );
 
-  const startElevenLabsFrom = useCallback(
+  const startVoiceStudioFrom = useCallback(
     async (startWordIdx: number) => {
       setEngineError(null);
       teardownStreamer();
@@ -341,7 +332,10 @@ export function TTSProvider({
       const streamer = new TTSStreamer({
         content,
         chunks,
-        voiceId: elevenLabsVoiceId ?? undefined,
+        // Use the same voice id that powers the avatar / player bar — the
+        // Reader voice list is already synced from Voice Studio so the
+        // ids match on both sides.
+        voiceId: voiceId ?? undefined,
         rate,
         onStatusChange: handleStreamerStatus,
         onTick: handleStreamerTick,
@@ -359,7 +353,7 @@ export function TTSProvider({
     [
       allWords,
       content,
-      elevenLabsVoiceId,
+      voiceId,
       handleStreamerStatus,
       handleStreamerTick,
       rate,
@@ -371,24 +365,24 @@ export function TTSProvider({
 
   const speakFrom = useCallback(
     (startWordIdx: number) => {
-      if (engine === "elevenlabs") {
-        void startElevenLabsFrom(startWordIdx);
+      if (engine === "voice-studio") {
+        void startVoiceStudioFrom(startWordIdx);
       } else {
         speakFromBrowser(startWordIdx);
       }
     },
-    [engine, speakFromBrowser, startElevenLabsFrom]
+    [engine, speakFromBrowser, startVoiceStudioFrom]
   );
 
   const play = useCallback(() => {
     if (status === "playing") return;
-    if (engine === "elevenlabs") {
+    if (engine === "voice-studio") {
       if (status === "paused" && streamerRef.current) {
         streamerRef.current.resume();
         setStatus("playing");
         return;
       }
-      void startElevenLabsFrom(currentWordIdx);
+      void startVoiceStudioFrom(currentWordIdx);
       return;
     }
     if (status === "paused" && window.speechSynthesis.paused) {
@@ -397,11 +391,11 @@ export function TTSProvider({
       return;
     }
     speakFromBrowser(currentWordIdx);
-  }, [status, engine, currentWordIdx, speakFromBrowser, startElevenLabsFrom]);
+  }, [status, engine, currentWordIdx, speakFromBrowser, startVoiceStudioFrom]);
 
   const pause = useCallback(() => {
     if (typeof window === "undefined") return;
-    if (engine === "elevenlabs") {
+    if (engine === "voice-studio") {
       if (status === "playing" && streamerRef.current) {
         streamerRef.current.pause();
         setStatus("paused");
@@ -460,7 +454,7 @@ export function TTSProvider({
     const idx = SPEED_CYCLE.findIndex((x) => Math.abs(x - rate) < 0.01);
     const next = SPEED_CYCLE[(idx + 1) % SPEED_CYCLE.length];
     setRate(next);
-    if (engine === "elevenlabs") {
+    if (engine === "voice-studio") {
       streamerRef.current?.setRate(next);
       return;
     }
@@ -499,17 +493,6 @@ export function TTSProvider({
     [engine, onEngineChange, teardownStreamer]
   );
 
-  const setElevenLabsVoiceId = useCallback(
-    (id: string) => {
-      setElevenLabsVoiceIdState(id);
-      onElevenLabsVoiceChange?.(id);
-      if (engine === "elevenlabs" && status === "playing") {
-        void startElevenLabsFrom(currentWordIdx);
-      }
-    },
-    [engine, status, currentWordIdx, onElevenLabsVoiceChange, startElevenLabsFrom]
-  );
-
   const jumpToWord = useCallback(
     (idx: number) => {
       if (clickToListenRef.current) speakFrom(idx);
@@ -540,10 +523,7 @@ export function TTSProvider({
     progressPct,
     engine,
     setEngine,
-    elevenLabsAvailable,
-    elevenLabsVoices,
-    elevenLabsVoiceId,
-    setElevenLabsVoiceId,
+    voiceStudioAvailable,
     engineError,
     clickToListen,
     play,

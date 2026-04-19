@@ -18,7 +18,6 @@ export type ReaderSettings = {
   clickToListen: boolean;
   autoSkip: AutoSkipSettings;
   ttsEngine: TTSEngine;
-  elevenLabsVoiceId: string | null;
 };
 
 export const defaultSettings: ReaderSettings = {
@@ -28,7 +27,6 @@ export const defaultSettings: ReaderSettings = {
   clickToListen: false,
   autoSkip: defaultAutoSkip,
   ttsEngine: "browser",
-  elevenLabsVoiceId: null,
 };
 
 export function applyTheme(theme: Theme) {
@@ -92,15 +90,7 @@ export function SettingsDrawer({
   pagesAvailable: boolean;
 }) {
   const [panel, setPanel] = useState<"main" | "autoskip">("main");
-  const {
-    engine,
-    setEngine,
-    elevenLabsAvailable,
-    elevenLabsVoices,
-    elevenLabsVoiceId,
-    setElevenLabsVoiceId,
-    engineError,
-  } = useTTS();
+  const { engine, setEngine, voiceStudioAvailable, engineError } = useTTS();
 
   if (!open) return null;
 
@@ -169,14 +159,14 @@ export function SettingsDrawer({
               <div>
                 <div className="text-sm font-medium">Audio Engine</div>
                 <div className="text-xs text-[color:var(--muted)]">
-                  {elevenLabsAvailable
-                    ? "Browser voices are free; ElevenLabs is higher quality."
-                    : "ElevenLabs isn't configured on this server."}
+                  {voiceStudioAvailable
+                    ? "Browser voices are free; Voice Studio uses your cloned voices via F5-TTS or XTTS on your Mac."
+                    : "Voice Studio isn't running — start it locally (./start.sh) to use cloned voices."}
                 </div>
               </div>
               <div className="seg">
-                {(["browser", "elevenlabs"] as TTSEngine[]).map((e) => {
-                  const disabled = e === "elevenlabs" && !elevenLabsAvailable;
+                {(["browser", "voice-studio"] as TTSEngine[]).map((e) => {
+                  const disabled = e === "voice-studio" && !voiceStudioAvailable;
                   return (
                     <button
                       key={e}
@@ -185,41 +175,19 @@ export function SettingsDrawer({
                       disabled={disabled}
                       title={
                         disabled
-                          ? "ElevenLabs API key not configured on this server"
+                          ? "Voice Studio not reachable at http://localhost:8000"
                           : ""
                       }
                       style={disabled ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
                     >
-                      {e === "browser" ? "Browser" : "ElevenLabs"}
+                      {e === "browser" ? "Browser" : "Voice Studio"}
                     </button>
                   );
                 })}
               </div>
             </section>
 
-            {engine === "elevenlabs" && elevenLabsAvailable && elevenLabsVoices.length > 0 && (
-              <section className="flex items-start justify-between gap-4">
-                <div>
-                  <div className="text-sm font-medium">ElevenLabs Voice</div>
-                  <div className="text-xs text-[color:var(--muted)]">
-                    Neural voice used by the ElevenLabs engine.
-                  </div>
-                </div>
-                <select
-                  value={elevenLabsVoiceId ?? ""}
-                  onChange={(e) => setElevenLabsVoiceId(e.target.value)}
-                  className="bg-[color:var(--surface-2)] border border-[color:var(--border)] rounded px-2 py-1 text-xs max-w-[160px]"
-                >
-                  {elevenLabsVoices.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.name}
-                    </option>
-                  ))}
-                </select>
-              </section>
-            )}
-
-            {engine === "elevenlabs" && engineError && (
+            {engine === "voice-studio" && engineError && (
               <div className="text-xs text-red-500 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
                 {engineError}
               </div>
