@@ -196,6 +196,12 @@ export function BrowserInferenceProvider({
   const [synthesizingSentenceIdx, setSynthesizingSentenceIdx] = useState<
     number | null
   >(null);
+  /** Last synth error, if any. Surfaced as a dismissible chip so the
+   *  user + devtools can see WHY playback stopped. */
+  const [synthError, setSynthError] = useState<{
+    sentenceIdx: number;
+    message: string;
+  } | null>(null);
 
   // Compute which sentence the currentWordIdx belongs to — drives
   // highlight at the sentence tier.
@@ -307,20 +313,30 @@ export function BrowserInferenceProvider({
       currentSentenceIdxRef.current = sentenceIdx;
       setCurrentWordIdx(firstWordOfSentence(sentenceIdx));
 
-      // Prefetch next sentence IMMEDIATELY — starts its synth in
-      // parallel with the current one's. ORT-Web serializes on the
-      // GPU kernel queue so we don't get full parallelism, but
-      // kicking off early means the next sentence's synth begins
-      // now instead of after this one's audio starts playing.
-      if (sentenceIdx + 1 < allSentences.length) {
-        void getSentenceSamples(sentenceIdx + 1);
-      }
+      // Prefetch REMOVED intentionally. Single-threaded ORT-Web +
+      // WebGPU can't actually run two sentence syntheses in parallel;
+      // the 8 fm_decoder.run() calls per sentence interleave (each
+      // iteration yields via await, giving the other sentence a
+      // chance to grab the session lock between steps). Net effect:
+      // "prefetch" made sentence 0 finish at 2× its solo time. Bad.
+      //
+      // Without prefetch, each sentence synthesizes in full before
+      // the next starts. Gap between sentences = full synth_time.
+      // Closing this gap is Workstream C (multi-threaded WASM,
+      // WebGPU kernel fixes, or a proper sentence-level scheduler
+      // that waits for current playback to START before queuing
+      // next synth).
 
       let samples: Float32Array;
       try {
         samples = await getSentenceSamples(sentenceIdx);
       } catch (e) {
-        console.error("[BrowserInference] synthesis failed:", e);
+        const msg = (e as Error).message;
+        console.error(
+          `[BrowserInference] sentence ${sentenceIdx} synth failed:`,
+          e
+        );
+        setSynthError({ sentenceIdx, message: msg });
         isPlayingAudioRef.current = false;
         setStatus("idle");
         return;
@@ -621,24 +637,19 @@ export function BrowserInferenceProvider({
       {providerStatus.kind === "voice-error" && (
         <VoiceLoadError message={providerStatus.message} voiceId={voiceId} />
       )}
-      {synthesizingSentenceIdx != null &&
-        status === "playing" &&
-        synthesizingSentenceIdx !== currentSentenceIdxRef.current && (
-          <SynthesizingChip
-            sentenceIdx={synthesizingSentenceIdx}
-            totalSentences={allSentences.length}
-            reason="prefetch"
-          />
-        )}
-      {synthesizingSentenceIdx != null &&
-        !isPlayingAudioRef.current &&
-        synthesizingSentenceIdx === currentSentenceIdxRef.current && (
-          <SynthesizingChip
-            sentenceIdx={synthesizingSentenceIdx}
-            totalSentences={allSentences.length}
-            reason="current"
-          />
-        )}
+      {synthesizingSentenceIdx != null && (
+        <SynthesizingChip
+          sentenceIdx={synthesizingSentenceIdx}
+          totalSentences={allSentences.length}
+        />
+      )}
+      {synthError && (
+        <SynthErrorChip
+          sentenceIdx={synthError.sentenceIdx}
+          message={synthError.message}
+          onDismiss={() => setSynthError(null)}
+        />
+      )}
       {children}
     </TTSContext.Provider>
   );
@@ -689,20 +700,40 @@ function VoiceLoadError({
 function SynthesizingChip({
   sentenceIdx,
   totalSentences,
-  reason,
 }: {
   sentenceIdx: number;
   totalSentences: number;
-  reason: "current" | "prefetch";
 }) {
-  const label =
-    reason === "prefetch"
-      ? `Prefetching sentence ${sentenceIdx + 1}/${totalSentences}…`
-      : `Synthesizing sentence ${sentenceIdx + 1}/${totalSentences}…`;
   return (
     <div className="fixed bottom-20 right-4 z-40 rounded-full border border-slate-700 bg-slate-900/90 backdrop-blur px-3 py-1.5 text-[11px] text-slate-200 shadow">
       <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse mr-2 align-middle" />
-      {label}
+      Synthesizing sentence {sentenceIdx + 1}/{totalSentences}…
+    </div>
+  );
+}
+
+function SynthErrorChip({
+  sentenceIdx,
+  message,
+  onDismiss,
+}: {
+  sentenceIdx: number;
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="fixed bottom-32 right-4 z-40 rounded-xl border border-red-500/50 bg-red-900/70 backdrop-blur px-3 py-2 text-[11px] text-red-50 shadow-lg max-w-sm">
+      <div className="font-semibold mb-0.5 flex items-center justify-between gap-3">
+        <span>Sentence {sentenceIdx + 1} failed</span>
+        <button
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          className="text-red-200 hover:text-white"
+        >
+          ×
+        </button>
+      </div>
+      <div className="text-red-200 break-words">{message}</div>
     </div>
   );
 }
