@@ -24,8 +24,16 @@ import { loadPromptMel, type PromptMel } from "@/lib/tts/prompt-mel";
 // ---------- Config ----------
 
 const N_MEL = 100;
-const NFE_STEPS = 4; // ZipVoice-Distill default
-const GUIDANCE_SCALE = 1.0; // distill was trained with guidance folded in
+// ZipVoice's infer_zipvoice_onnx.py hard-codes these per model variant
+// (see `default_values` dict at the bottom of that file):
+//   zipvoice          → num_step=16, guidance_scale=1.0
+//   zipvoice_distill  → num_step=8,  guidance_scale=3.0
+// The distill paper claims "competitive at 4 NFE" but ships the official
+// CLI at 8 for quality headroom. We match the official defaults because
+// when Dan A/B'd these against Spike D's Felix-GREEN output, 4 NFE +
+// guidance=1.0 produced low-quality speech where 8 + 3.0 didn't.
+const NFE_STEPS = 8;
+const GUIDANCE_SCALE = 3.0;
 const T_SHIFT = 0.5; // ZipVoice default, emphasizes low-SNR region
 
 /** The one hardcoded voice for the dev harness until the UI supports
