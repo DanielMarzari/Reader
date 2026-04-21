@@ -33,6 +33,52 @@ import { synthesizeSentence } from "@/lib/tts/synth";
 import { VOCOS_ISTFT_CONFIG } from "@/lib/tts/istft";
 import type { DownloadProgress } from "@/lib/tts/browser-inference";
 
+// ---------- Module-level sentence sample cache ----------
+//
+// Keyed on `${voiceId}|${docId}|${sentenceIdx}|${textHash}` so navigating
+// document → back → document doesn't re-synth. We cache raw Float32
+// samples (AudioContext-independent) and rebuild an AudioBuffer per
+// playback — AudioBuffers are tied to a specific AudioContext that
+// gets destroyed on unmount, so reusing the BUFFER across provider
+// instances fails. Samples Just Work.
+//
+// ~3s of audio = 72 KB (24 kHz × 3 × 4 bytes). Cap at 200 sentences
+// ≈ 14 MB for a long doc. Trivially fits in memory.
+
+type SentenceSamples = Float32Array;
+
+const _sentenceCache = new Map<string, SentenceSamples>();
+const SENTENCE_CACHE_MAX = 200;
+
+function cacheKey(
+  voiceId: string,
+  docId: string,
+  sentenceIdx: number,
+  text: string
+): string {
+  // FNV-1a of the text guards against stale entries if the doc
+  // content mutates under a fixed id. Collisions are harmless — we
+  // just re-synth.
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${voiceId}|${docId}|${sentenceIdx}|${(h >>> 0).toString(36)}`;
+}
+
+function cacheGet(key: string): SentenceSamples | null {
+  return _sentenceCache.get(key) ?? null;
+}
+
+function cachePut(key: string, samples: SentenceSamples) {
+  if (_sentenceCache.size >= SENTENCE_CACHE_MAX) {
+    const oldest = _sentenceCache.keys().next().value;
+    if (oldest) _sentenceCache.delete(oldest);
+  }
+  _sentenceCache.set(key, samples);
+}
+
 const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
 
 // When Web Audio doesn't give us word-level timing (ZipVoice doesn't),
@@ -130,16 +176,26 @@ export function BrowserInferenceProvider({
   }, [voiceId, selectedVoice, bundle]);
 
   // ---------- Audio context + playback queue ----------
-  // Strategy: maintain a Map<sentenceIdx, Promise<AudioBuffer>>. On
-  // play(), synthesize current sentence, start it playing, and in
-  // parallel kick off synthesis of the next one. When current ends,
-  // advance + repeat. Skip / seek jumps the cursor.
+  // Strategy: sentence samples cached at module scope (persists across
+  // navigations). Per-call prefetch cache holds in-flight synthesis
+  // promises so multiple getSentenceSamples calls for the same sentence
+  // dedupe to one WebGPU run.
   const audioCtxRef = useRef<AudioContext | null>(null);
   const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const playbackStartedAtRef = useRef<number>(0);
   const currentSentenceIdxRef = useRef<number>(0);
-  const pendingRef = useRef<Map<number, Promise<AudioBuffer>>>(new Map());
+  const pendingRef = useRef<Map<number, Promise<Float32Array>>>(new Map());
   const stopRequestedRef = useRef(false);
+  /** True while an AudioBufferSourceNode is actively emitting audio.
+   *  Separate from `status` because we want the highlight tick to
+   *  advance only during actual playback, not during the synth gaps
+   *  before sentence N+1's audio starts. */
+  const isPlayingAudioRef = useRef(false);
+  /** Sentence currently being synthesized for the first time (shown in
+   *  the UI so the user knows why there's a delay). null = not synthing. */
+  const [synthesizingSentenceIdx, setSynthesizingSentenceIdx] = useState<
+    number | null
+  >(null);
 
   // Compute which sentence the currentWordIdx belongs to — drives
   // highlight at the sentence tier.
@@ -181,11 +237,12 @@ export function BrowserInferenceProvider({
 
   // ---------- Synthesis ----------
 
-  /** Synthesize a sentence, wrapping it in a memoized promise so
-   *  prefetches and play() calls dedupe. Returns the AudioBuffer
-   *  decoded into the shared AudioContext. */
-  const getSentenceAudio = useCallback(
-    (sentenceIdx: number): Promise<AudioBuffer> => {
+  /** Synthesize a sentence → Float32 samples. Uses the module-level
+   *  cache for cross-session reuse; in-flight synth calls dedupe via
+   *  pendingRef so a prefetch + a play() of the same sentence only
+   *  kick off one WebGPU run. */
+  const getSentenceSamples = useCallback(
+    (sentenceIdx: number): Promise<Float32Array> => {
       const existing = pendingRef.current.get(sentenceIdx);
       if (existing) return existing;
 
@@ -194,39 +251,55 @@ export function BrowserInferenceProvider({
         const text = sentenceText(sentenceIdx);
         if (!text) throw new Error(`Empty sentence ${sentenceIdx}`);
 
-        const { samples } = await synthesizeSentence(bundle, text);
+        const key = cacheKey(bundle.voiceId, docId, sentenceIdx, text);
+        const cached = cacheGet(key);
+        if (cached) return cached;
 
-        if (!audioCtxRef.current) {
-          audioCtxRef.current = new AudioContext({
-            sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
-          });
+        // Mark as synthesizing for the UI — only if nobody else beat
+        // us to it (race with prefetch).
+        setSynthesizingSentenceIdx((cur) => (cur == null ? sentenceIdx : cur));
+        try {
+          const { samples } = await synthesizeSentence(bundle, text);
+          cachePut(key, samples);
+          return samples;
+        } finally {
+          setSynthesizingSentenceIdx((cur) =>
+            cur === sentenceIdx ? null : cur
+          );
         }
-        const ctx = audioCtxRef.current;
-        const buf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
-        buf.copyToChannel(
-          samples as unknown as Float32Array<ArrayBuffer>,
-          0
-        );
-        return buf;
       })();
 
-      // If it fails, drop the cached entry so a retry can regenerate
-      // rather than resurrecting the error forever.
       promise.catch(() => pendingRef.current.delete(sentenceIdx));
       pendingRef.current.set(sentenceIdx, promise);
       return promise;
     },
-    [bundle, sentenceText]
+    [bundle, docId, sentenceText]
   );
 
-  /** Start playback of a sentence. Stops any current playback,
-   *  schedules the next sentence's synthesis in parallel, advances
-   *  the cursor when the buffer finishes. */
+  /** Turn Float32 samples into an AudioBuffer on the shared context. */
+  const buildBuffer = useCallback((samples: Float32Array): AudioBuffer => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext({
+        sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
+      });
+    }
+    const ctx = audioCtxRef.current;
+    const buf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
+    buf.copyToChannel(
+      samples as unknown as Float32Array<ArrayBuffer>,
+      0
+    );
+    return buf;
+  }, []);
+
+  /** Start playback of a sentence. Kicks off prefetch of sentence N+1
+   *  BEFORE awaiting current synth so two synthesis calls (current +
+   *  next) run as concurrently as the underlying runtime allows. */
   const playSentence = useCallback(
     async (sentenceIdx: number) => {
       if (!bundle) return;
       if (sentenceIdx >= allSentences.length) {
-        // End of document.
+        isPlayingAudioRef.current = false;
         setStatus("idle");
         return;
       }
@@ -234,28 +307,33 @@ export function BrowserInferenceProvider({
       currentSentenceIdxRef.current = sentenceIdx;
       setCurrentWordIdx(firstWordOfSentence(sentenceIdx));
 
-      let buffer: AudioBuffer;
+      // Prefetch next sentence IMMEDIATELY — starts its synth in
+      // parallel with the current one's. ORT-Web serializes on the
+      // GPU kernel queue so we don't get full parallelism, but
+      // kicking off early means the next sentence's synth begins
+      // now instead of after this one's audio starts playing.
+      if (sentenceIdx + 1 < allSentences.length) {
+        void getSentenceSamples(sentenceIdx + 1);
+      }
+
+      let samples: Float32Array;
       try {
-        buffer = await getSentenceAudio(sentenceIdx);
+        samples = await getSentenceSamples(sentenceIdx);
       } catch (e) {
         console.error("[BrowserInference] synthesis failed:", e);
+        isPlayingAudioRef.current = false;
         setStatus("idle");
         return;
       }
       if (stopRequestedRef.current) return; // user paused/seeked during synth
 
-      // Pre-fetch the next sentence while this one plays.
-      if (sentenceIdx + 1 < allSentences.length) {
-        // Fire-and-forget — errors will surface when we actually
-        // try to play it.
-        void getSentenceAudio(sentenceIdx + 1);
-      }
-
-      const ctx = audioCtxRef.current!;
+      const ctx = audioCtxRef.current ??
+        (audioCtxRef.current = new AudioContext({
+          sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
+        }));
       if (ctx.state === "suspended") await ctx.resume();
 
-      // Stop any existing source. Clears out the sentence we just
-      // finished, or the one interrupted by a seek.
+      // Stop any existing source.
       if (currentSourceRef.current) {
         try {
           currentSourceRef.current.onended = null;
@@ -265,19 +343,20 @@ export function BrowserInferenceProvider({
         }
       }
 
+      const buffer = buildBuffer(samples);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.playbackRate.value = rate;
       src.connect(ctx.destination);
       currentSourceRef.current = src;
       playbackStartedAtRef.current = ctx.currentTime;
+      isPlayingAudioRef.current = true;
 
       src.onended = () => {
-        // If user paused (which calls .stop()), onended fires too —
-        // suppress via stopRequestedRef so we don't auto-advance.
         if (stopRequestedRef.current) return;
-        if (currentSourceRef.current !== src) return; // superseded by a newer sentence
-        setCurrentWordIdx(lastWordOfSentence(sentenceIdx));
+        if (currentSourceRef.current !== src) return;
+        isPlayingAudioRef.current = false;
+        setCurrentWordIdx(firstWordOfSentence(sentenceIdx + 1));
         void playSentence(sentenceIdx + 1);
       };
 
@@ -288,8 +367,8 @@ export function BrowserInferenceProvider({
       bundle,
       allSentences.length,
       firstWordOfSentence,
-      lastWordOfSentence,
-      getSentenceAudio,
+      getSentenceSamples,
+      buildBuffer,
       rate,
     ]
   );
@@ -298,14 +377,19 @@ export function BrowserInferenceProvider({
   //
   // ZipVoice doesn't emit per-word timings. We drive highlight via
   // elapsed time × WORDS_PER_SECOND × rate within the current sentence.
-  // Accurate enough for a reader UI; better alignment is a future
-  // improvement (attention-weight readout or forced alignment).
+  // Gated on isPlayingAudioRef (not just `status`) so the highlight
+  // stays pinned at the sentence-start word during synth gaps instead
+  // of racing to the end based on a stale playbackStartedAt.
   useEffect(() => {
     let raf = 0;
     const tick = () => {
       const ctx = audioCtxRef.current;
-      const src = currentSourceRef.current;
-      if (status === "playing" && ctx && src) {
+      if (
+        isPlayingAudioRef.current &&
+        status === "playing" &&
+        ctx &&
+        ctx.state === "running"
+      ) {
         const elapsed = ctx.currentTime - playbackStartedAtRef.current;
         setElapsedSec(elapsed);
         const sIdx = currentSentenceIdxRef.current;
@@ -336,6 +420,7 @@ export function BrowserInferenceProvider({
       // Web Audio BufferSourceNodes can't be resumed once stopped,
       // so "pause" suspends the AudioContext instead. Resume here.
       audioCtxRef.current?.resume();
+      isPlayingAudioRef.current = true;
       setStatus("playing");
       return;
     }
@@ -347,6 +432,7 @@ export function BrowserInferenceProvider({
     // Suspend the AudioContext — keeps our scheduled BufferSourceNode
     // alive so resume() picks up seamlessly. (If we .stop() here,
     // onended would fire and auto-advance us.)
+    isPlayingAudioRef.current = false;
     void audioCtxRef.current?.suspend();
     setStatus("paused");
   }, [status]);
@@ -354,6 +440,7 @@ export function BrowserInferenceProvider({
   const seekToWord = useCallback(
     (wordIdx: number, startPlaying = true) => {
       stopRequestedRef.current = true;
+      isPlayingAudioRef.current = false;
       if (currentSourceRef.current) {
         try {
           currentSourceRef.current.onended = null;
@@ -368,8 +455,9 @@ export function BrowserInferenceProvider({
       const sIdx = word.sentenceIndex;
       currentSentenceIdxRef.current = sIdx;
       setCurrentWordIdx(wordIdx);
-      // Clear queued sentences (they may have been synthesized at
-      // the wrong position relative to the user's new cursor).
+      // Clear in-flight pending synth promises (stale positions).
+      // The MODULE cache of completed samples is preserved — if we
+      // seek to a sentence we already synth'd, it plays instantly.
       pendingRef.current.clear();
       setElapsedSec(0);
       if (startPlaying) {
@@ -533,6 +621,24 @@ export function BrowserInferenceProvider({
       {providerStatus.kind === "voice-error" && (
         <VoiceLoadError message={providerStatus.message} voiceId={voiceId} />
       )}
+      {synthesizingSentenceIdx != null &&
+        status === "playing" &&
+        synthesizingSentenceIdx !== currentSentenceIdxRef.current && (
+          <SynthesizingChip
+            sentenceIdx={synthesizingSentenceIdx}
+            totalSentences={allSentences.length}
+            reason="prefetch"
+          />
+        )}
+      {synthesizingSentenceIdx != null &&
+        !isPlayingAudioRef.current &&
+        synthesizingSentenceIdx === currentSentenceIdxRef.current && (
+          <SynthesizingChip
+            sentenceIdx={synthesizingSentenceIdx}
+            totalSentences={allSentences.length}
+            reason="current"
+          />
+        )}
       {children}
     </TTSContext.Provider>
   );
@@ -576,6 +682,27 @@ function VoiceLoadError({
     <div className="fixed bottom-4 right-4 z-50 rounded-xl border border-red-500/50 bg-red-900/70 backdrop-blur px-4 py-3 text-xs text-red-50 shadow-lg max-w-sm">
       <div className="font-semibold mb-1">Voice unavailable: {voiceId}</div>
       <div className="text-red-200">{message}</div>
+    </div>
+  );
+}
+
+function SynthesizingChip({
+  sentenceIdx,
+  totalSentences,
+  reason,
+}: {
+  sentenceIdx: number;
+  totalSentences: number;
+  reason: "current" | "prefetch";
+}) {
+  const label =
+    reason === "prefetch"
+      ? `Prefetching sentence ${sentenceIdx + 1}/${totalSentences}…`
+      : `Synthesizing sentence ${sentenceIdx + 1}/${totalSentences}…`;
+  return (
+    <div className="fixed bottom-20 right-4 z-40 rounded-full border border-slate-700 bg-slate-900/90 backdrop-blur px-3 py-1.5 text-[11px] text-slate-200 shadow">
+      <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse mr-2 align-middle" />
+      {label}
     </div>
   );
 }
