@@ -7,10 +7,9 @@
 // One call per sentence. Streaming / pipelining is a higher-level
 // concern and happens in the provider.
 
-// Must match the import subpath in browser-inference.ts — ORT-Web's
-// type Tensor is the same either way, but we want the `webgpu` bundle
-// loaded once, shared across modules.
-import * as ort from "onnxruntime-web/webgpu";
+// Matches browser-inference.ts's default-entry import. See comment
+// there for why we can't use the /webgpu subpath under Turbopack.
+import * as ort from "onnxruntime-web";
 import {
   VOCOS_FREQ_BINS,
   VOCOS_ISTFT_CONFIG,
