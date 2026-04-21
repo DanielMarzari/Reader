@@ -17,6 +17,42 @@ import {
 import { scalarFloat, scalarInt64 } from "@/lib/tts/browser-inference";
 import type { VoiceBundle } from "@/lib/tts/voice-bundle";
 
+// ---------- Per-session serialization ----------
+//
+// ORT-Web's WebGPU backend is NOT safe against concurrent session.run()
+// calls on the same InferenceSession — two overlapping runs corrupt
+// each other's output buffers and produce errors like
+//
+//   "Can't access output tensor data on index 2. ERROR_CODE: 9,
+//    ERROR_MESSAGE: Reading data from non-tensor typed value is not
+//    supported."
+//
+// (seen on vocos when prefetch-next fires a second vocos.run() while
+// the current one is still in flight).
+//
+// Fix: serialize calls per session via a promise-chain mutex. Per-
+// session means different sessions (text_encoder vs fm_decoder vs
+// vocos) can still run in parallel — that's safe, the sessions are
+// independent. Only multiple calls to the SAME session queue.
+//
+// The mutex lives at module scope so prefetch + current-sentence
+// synth, which run in separate async contexts, share the same lock
+// per session instance.
+
+const _sessionLocks = new WeakMap<ort.InferenceSession, Promise<unknown>>();
+
+async function runSerialized(
+  session: ort.InferenceSession,
+  feeds: Record<string, ort.Tensor>
+): Promise<ort.InferenceSession.OnnxValueMapType> {
+  const prev = _sessionLocks.get(session) ?? Promise.resolve();
+  const current = prev.then(() => session.run(feeds));
+  // Swallow errors in the lock's promise chain so a failed run
+  // doesn't poison all subsequent calls on this session.
+  _sessionLocks.set(session, current.catch(() => {}));
+  return current;
+}
+
 // --- ZipVoice-Distill inference constants (matched to
 // zipvoice/bin/infer_zipvoice_onnx.py's default_values) ---
 const N_MEL = 100;
@@ -103,7 +139,7 @@ export async function synthesizeSentence(
   };
 
   const teStart = performance.now();
-  const teOut = await bundle.sessions.textEncoder.run(teFeeds);
+  const teOut = await runSerialized(bundle.sessions.textEncoder, teFeeds);
   const textCondition = teOut.text_condition ?? teOut[Object.keys(teOut)[0]];
   const textEncoderMs = performance.now() - teStart;
 
@@ -158,7 +194,7 @@ export async function synthesizeSentence(
       guidance_scale: scalarFloat(GUIDANCE_SCALE),
     };
     const stepT0 = performance.now();
-    const fmOut = await bundle.sessions.fmDecoder.run(fmFeeds);
+    const fmOut = await runSerialized(bundle.sessions.fmDecoder, fmFeeds);
     const v = fmOut.v ?? fmOut[Object.keys(fmOut)[0]];
     fmDecoderStepsMs.push(performance.now() - stepT0);
 
@@ -187,7 +223,7 @@ export async function synthesizeSentence(
     mels: new ort.Tensor("float32", melForVocos, [1, N_MEL, targetFrames]),
   };
   const vocosStart = performance.now();
-  const vocosOut = await bundle.sessions.vocos.run(vocosFeeds);
+  const vocosOut = await runSerialized(bundle.sessions.vocos, vocosFeeds);
   const vocosMs = performance.now() - vocosStart;
 
   const mag = vocosOut.mag ?? vocosOut[Object.keys(vocosOut)[0]];
