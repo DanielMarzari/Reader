@@ -73,6 +73,16 @@ let _ortConfigured = false;
  *  creating the first InferenceSession. */
 export function configureOrt() {
   if (_ortConfigured) return;
+
+  // ORT's graph-loader logs warnings like "Some nodes were not
+  // assigned to the preferred execution providers" whenever any op
+  // falls back from WebGPU/JSEP to CPU — which is NORMAL and
+  // intentional (shape ops prefer CPU). Next.js dev mode surfaces
+  // every ORT warning as a full-screen modal error overlay, which
+  // is both confusing and screen-blocking. Silence ORT below the
+  // error level.
+  ort.env.logLevel = "error";
+
   // String prefix form: ORT appends the right filename for whichever
   // backend it's loading — `ort-wasm-simd-threaded.jsep.{mjs,wasm}` for
   // WebGPU (JSEP), `ort-wasm-simd-threaded.{mjs,wasm}` for plain WASM.
