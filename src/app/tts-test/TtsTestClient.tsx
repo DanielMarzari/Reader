@@ -19,26 +19,47 @@ import {
   transposeForIstft,
 } from "@/lib/tts/istft";
 import { ZipVoiceTokenizer } from "@/lib/tts/tokenizer";
+import { loadPromptMel, type PromptMel } from "@/lib/tts/prompt-mel";
 
 // ---------- Config ----------
 
 const N_MEL = 100;
 const NFE_STEPS = 4; // ZipVoice-Distill default
+const GUIDANCE_SCALE = 1.0; // distill was trained with guidance folded in
+const T_SHIFT = 0.5; // ZipVoice default, emphasizes low-SNR region
 
-// ZipVoice computes the output mel length at inference time as
-//   features_len = ceil(prompt_features_len / prompt_tokens_len * tokens_len / speed)
-// so output length scales with the target text length. For the /tts-test
-// page we don't know the real prompt_features_len yet (that comes with
-// the prompt_mel milestone), so we pick values that produce a sensible
-// output length per token and iterate on the multiplier as we learn.
-/** Mel frames per token as a coarse heuristic. English prompts typically
- *  give ~8–12 mel frames per phoneme; Felix's 8.3s prompt with ~90 chars
- *  of phonemized transcript (Spike D) works out to ~9.4. */
-const FRAMES_PER_TOKEN = 10;
+/** The one hardcoded voice for the dev harness until the UI supports
+ *  picking from the Reader voice library. Symlinked into public/tts-assets/
+ *  voices/<id>/ by the one-off compute_prompt_mel.py run. */
+const DEFAULT_VOICE_ID = "0e97772fe314"; // Alex
 
 const DEFAULT_TEXT = "The morning light filtered through the kitchen blinds.";
 const DEFAULT_PROMPT_TEXT =
   "Hello, I can provide conversational narration in English with an authentic European French accent.";
+
+/** Time-step schedule for the ODE solver. Port of
+ *  zipvoice.models.modules.solver.get_time_steps. Returns an array of
+ *  length N+1. t_shift < 1 biases toward smaller t (low-SNR region). */
+function getTimeSteps(numStep: number, tShift = T_SHIFT): Float32Array {
+  const out = new Float32Array(numStep + 1);
+  for (let i = 0; i <= numStep; i++) {
+    const t = i / numStep; // linear 0..1
+    out[i] = (tShift * t) / (1 + (tShift - 1) * t);
+  }
+  return out;
+}
+
+/** Box-Muller: 2 uniform → 1 unit-Gaussian sample.  */
+function gauss(): number {
+  const u = Math.max(1e-10, Math.random());
+  const v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+/** Fill a buffer with gaussian noise in-place. */
+function fillGaussian(out: Float32Array) {
+  for (let i = 0; i < out.length; i++) out[i] = gauss();
+}
 
 type LogLine = { text: string; ts: number; kind: "info" | "ok" | "err" };
 
@@ -63,6 +84,7 @@ export function TtsTestClient() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [promptText, setPromptText] = useState(DEFAULT_PROMPT_TEXT);
   const [tokenizer, setTokenizer] = useState<ZipVoiceTokenizer | null>(null);
+  const [promptMel, setPromptMel] = useState<PromptMel | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
 
@@ -105,10 +127,10 @@ export function TtsTestClient() {
   const loadModels = useCallback(async () => {
     if (sessions || loading) return;
     setLoading("download");
-    append("Downloading ONNX models + tokenizer vocab…");
+    append("Downloading ONNX models + tokenizer vocab + voice prompt_mel…");
     try {
       const shared = defaultSharedAssets();
-      const [s, tok] = await Promise.all([
+      const [s, tok, pmel] = await Promise.all([
         createSessions(shared, (p) => {
           setDlProgress((prev) => ({ ...prev, [p.url]: p }));
         }),
@@ -117,9 +139,11 @@ export function TtsTestClient() {
           await t.loadVocab(shared.tokensUrl);
           return t;
         })(),
+        loadPromptMel(DEFAULT_VOICE_ID),
       ]);
       setSessions(s);
       setTokenizer(tok);
+      setPromptMel(pmel);
       append(
         `Sessions ready on ${s.provider} EP · text_encoder: ${s.textEncoder.inputNames.join(
           ", "
@@ -132,6 +156,13 @@ export function TtsTestClient() {
       );
       append(`vocos inputs: ${s.vocos.inputNames.join(", ")}`, "ok");
       append(`tokenizer vocab: ${tok.vocabSize()} entries`, "ok");
+      append(
+        `prompt_mel for ${pmel.voiceId}: ${pmel.numFrames} frames × ` +
+          `${pmel.nMels} mels (${
+            (pmel.numFrames * pmel.hopLength) / pmel.sampleRate
+          }s prompt audio, feat_scale=${pmel.featScale})`,
+        "ok"
+      );
     } catch (e) {
       append(`Load failed: ${(e as Error).message}`, "err");
       console.error(e);
@@ -143,7 +174,7 @@ export function TtsTestClient() {
   // ---------- Run end-to-end pipeline ----------
 
   const runPipeline = useCallback(async () => {
-    if (!sessions || !tokenizer || loading) return;
+    if (!sessions || !tokenizer || !promptMel || loading) return;
     setLoading("run");
     setAudioUrl(null);
 
@@ -175,22 +206,11 @@ export function TtsTestClient() {
         );
       }
 
-      // Output mel length — heuristic until we have real prompt_features_len.
-      // The model uses ratio (prompt_features_len / prompt_tokens_len) to
-      // decide how many mel frames per target token, so we pick
-      // prompt_features_len = prompt_tokens_len * FRAMES_PER_TOKEN to get
-      // FRAMES_PER_TOKEN mel frames per target token on average.
-      const promptFeaturesLen = Math.max(
-        prompt.ids.length * FRAMES_PER_TOKEN,
-        1
-      );
-      const seqLenFrames = target.ids.length * FRAMES_PER_TOKEN;
-      append(
-        `  pipeline: ${seqLenFrames} mel frames, ${NFE_STEPS} NFE steps, ` +
-          `prompt_features_len=${promptFeaturesLen}`
-      );
-
       // --- 1. text_encoder ---
+      // Real prompt_features_len comes from the loaded prompt_mel asset.
+      // Output num_frames is decided by the model based on prompt_features_len
+      // + tokens + speed — we don't pick it, we read it from the output.
+      const promptFeaturesLen = promptMel.numFrames;
       const teFeeds = {
         tokens: new ort.Tensor("int64", target.ids, [1, target.ids.length]),
         prompt_tokens: new ort.Tensor("int64", prompt.ids, [
@@ -204,70 +224,104 @@ export function TtsTestClient() {
       const tTextStart = performance.now();
       const teOut = await sessions.textEncoder.run(teFeeds);
       const textCondition = teOut.text_condition ?? teOut[Object.keys(teOut)[0]];
+      const [, numFrames, featDim] = textCondition.dims as [number, number, number];
       append(
         `  text_encoder: ${(performance.now() - tTextStart).toFixed(0)} ms · ` +
-          `output shape [${textCondition.dims.join(", ")}]`
+          `output [1, ${numFrames}, ${featDim}]`
+      );
+      if (featDim !== N_MEL) {
+        append(
+          `  ⚠ text_encoder output feat_dim=${featDim}, expected ${N_MEL}`,
+          "info"
+        );
+      }
+      const targetFrames = numFrames - promptFeaturesLen;
+      if (targetFrames <= 0) {
+        throw new Error(
+          `text_encoder produced ${numFrames} frames, but prompt_features_len ` +
+            `is ${promptFeaturesLen} — no target frames left. Is the prompt ` +
+            `audio way too long relative to the target text?`
+        );
+      }
+      append(
+        `    prompt=${promptFeaturesLen} frames · target=${targetFrames} frames · total=${numFrames}`
       );
 
-      // Coerce text_encoder output (N, T_out, concat_dim) down to the
-      // fm_decoder's (N, T_out, 100). The model's internal duration
-      // modelling aligns T_out based on prompt_features_len — we take
-      // the first `seqLenFrames` frames to match our planned output
-      // length. If T_out < seqLenFrames the remainder pads with zeros.
-      const coercedCond = coerceCondToMel(
-        textCondition.data as Float32Array,
-        textCondition.dims as number[],
-        seqLenFrames
-      );
+      // --- 2. Build x (gaussian noise) + speech_condition ([prompt_mel*scale, zeros]) ---
+      const totalLen = 1 * numFrames * N_MEL;
+      let xData = new Float32Array(totalLen);
+      fillGaussian(xData);
 
-      // --- 2. fm_decoder × NFE_STEPS with Euler integration ---
-      let xData = new Float32Array(1 * seqLenFrames * N_MEL);
-      // Initialize as Gaussian-ish noise; zero is valid too for timing.
-      for (let i = 0; i < xData.length; i++) xData[i] = (Math.random() - 0.5);
-      // speech_condition is a placeholder (zeros) until the prompt_mel
-      // milestone ships real reference mels per voice.
-      const speechData = new Float32Array(1 * seqLenFrames * N_MEL);
+      const speechData = new Float32Array(totalLen);
+      // First promptFeaturesLen frames = prompt mel × feat_scale.
+      // Remaining targetFrames × N_MEL = already zeros.
+      const scale = promptMel.featScale;
+      const promptLen = Math.min(promptFeaturesLen, promptMel.numFrames);
+      for (let i = 0; i < promptLen; i++) {
+        for (let c = 0; c < N_MEL; c++) {
+          speechData[i * N_MEL + c] =
+            promptMel.data[i * N_MEL + c] * scale;
+        }
+      }
       const speechCondTensor = new ort.Tensor(
         "float32",
         speechData,
-        [1, seqLenFrames, N_MEL]
+        [1, numFrames, N_MEL]
       );
 
+      // --- 3. fm_decoder × NFE_STEPS with Euler + t_shift schedule ---
+      const timesteps = getTimeSteps(NFE_STEPS, T_SHIFT);
+      append(
+        `  timesteps (t_shift=${T_SHIFT}): ${Array.from(timesteps)
+          .map((t) => t.toFixed(3))
+          .join(", ")}`
+      );
       let totalFmMs = 0;
-      for (let s = 0; s < NFE_STEPS; s++) {
-        const tFlow = s / NFE_STEPS;
+      for (let step = 0; step < NFE_STEPS; step++) {
         const xTensor = new ort.Tensor("float32", xData, [
           1,
-          seqLenFrames,
+          numFrames,
           N_MEL,
         ]);
         const fmFeeds = {
-          t: scalarFloat(tFlow),
+          t: scalarFloat(timesteps[step]),
           x: xTensor,
-          text_condition: coercedCond,
+          text_condition: textCondition,
           speech_condition: speechCondTensor,
-          guidance_scale: scalarFloat(1.0),
+          guidance_scale: scalarFloat(GUIDANCE_SCALE),
         };
         const tFmStart = performance.now();
         const fmOut = await sessions.fmDecoder.run(fmFeeds);
         const v = fmOut.v ?? fmOut[Object.keys(fmOut)[0]];
         const stepMs = performance.now() - tFmStart;
         totalFmMs += stepMs;
-        append(`  fm_decoder step ${s + 1}/${NFE_STEPS}: ${stepMs.toFixed(0)} ms`);
+        append(
+          `  fm_decoder step ${step + 1}/${NFE_STEPS} (t=${timesteps[step].toFixed(3)}): ${stepMs.toFixed(0)} ms`
+        );
 
-        // Euler update: x_{t+dt} = x_t + dt * v
-        const dt = 1 / NFE_STEPS;
+        const dtFlow = timesteps[step + 1] - timesteps[step];
         const vData = v.data as Float32Array;
         const newX = new Float32Array(xData.length);
-        for (let i = 0; i < xData.length; i++) newX[i] = xData[i] + dt * vData[i];
+        for (let i = 0; i < xData.length; i++) newX[i] = xData[i] + dtFlow * vData[i];
         xData = newX;
       }
 
-      // --- 3. Vocos: mel → (mag, cos, sin) ---
-      // fm_decoder outputs mel as [1, T, 100]. Vocos wants [1, 100, T].
-      const melForVocos = transposeMelForVocos(xData, seqLenFrames, N_MEL);
+      // --- 4. Slice off prompt frames, un-scale feat_scale, feed to vocos ---
+      // xData is row-major [numFrames, N_MEL]. Slice out frames
+      // [promptFeaturesLen, numFrames).
+      const genMel = new Float32Array(targetFrames * N_MEL);
+      for (let i = 0; i < targetFrames; i++) {
+        const srcRow = (promptFeaturesLen + i) * N_MEL;
+        const dstRow = i * N_MEL;
+        for (let c = 0; c < N_MEL; c++) {
+          genMel[dstRow + c] = xData[srcRow + c] / scale; // un-scale
+        }
+      }
+
+      // --- 5. Vocos: mel → (mag, cos, sin). Vocos wants [1, 100, T]. ---
+      const melForVocos = transposeMelForVocos(genMel, targetFrames, N_MEL);
       const vocosFeeds = {
-        mels: new ort.Tensor("float32", melForVocos, [1, N_MEL, seqLenFrames]),
+        mels: new ort.Tensor("float32", melForVocos, [1, N_MEL, targetFrames]),
       };
       const tVocosStart = performance.now();
       const vocosOut = await sessions.vocos.run(vocosFeeds);
@@ -281,26 +335,26 @@ export function TtsTestClient() {
       const magData = transposeForIstft(
         mag.data as Float32Array,
         VOCOS_FREQ_BINS,
-        seqLenFrames
+        targetFrames
       );
       const cosData = transposeForIstft(
         cx.data as Float32Array,
         VOCOS_FREQ_BINS,
-        seqLenFrames
+        targetFrames
       );
       const sinData = transposeForIstft(
         sy.data as Float32Array,
         VOCOS_FREQ_BINS,
-        seqLenFrames
+        targetFrames
       );
 
-      // --- 4. iSTFT (JS) ---
+      // --- 6. iSTFT (JS) ---
       const tIstftStart = performance.now();
       const audioSamples = istftVocos({
         mag: magData,
         cosPhase: cosData,
         sinPhase: sinData,
-        numFrames: seqLenFrames,
+        numFrames: targetFrames,
       });
       append(
         `  iSTFT (JS): ${(performance.now() - tIstftStart).toFixed(0)} ms · ` +
@@ -325,13 +379,20 @@ export function TtsTestClient() {
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
 
-      // Also play it directly
+      // Also play it directly. Chrome suspends AudioContexts that weren't
+      // created in direct response to a user gesture; even though the
+      // "Run" button click IS a gesture, by the time we get here we're
+      // several await ticks past it and Chrome may have already put the
+      // context to sleep. Explicit resume() is cheap and safe.
       if (!audioCtxRef.current) {
         audioCtxRef.current = new AudioContext({
           sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
         });
       }
       const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
       const buf = ctx.createBuffer(1, audioSamples.length, ctx.sampleRate);
       // copyToChannel's signature in recent TS lib.dom.d.ts pins the typed-
       // array backing store to ArrayBuffer (not SharedArrayBuffer). Float32
@@ -346,6 +407,7 @@ export function TtsTestClient() {
       src.buffer = buf;
       src.connect(ctx.destination);
       src.start();
+      append(`  audio: ${ctx.state} · playing ${audioSec.toFixed(2)}s`, "ok");
     } catch (e) {
       append(`Run failed: ${(e as Error).message}`, "err");
       console.error(e);
@@ -515,26 +577,6 @@ function LogPanel({ lines }: { lines: LogLine[] }) {
 }
 
 // ---------- Helpers ----------
-
-/** text_encoder outputs [N, T, concat_dim] where concat_dim ≠ 100.
- *  fm_decoder expects text_condition at [N, T, 100]. For the feasibility
- *  test we slice the first 100 channels. Phase 3 proper will replace
- *  this with ZipVoice's length-regulation / pooling step. */
-function coerceCondToMel(
-  data: Float32Array,
-  dims: number[],
-  targetFrames: number
-): ort.Tensor {
-  const [, t, inDim] = dims;
-  const frames = Math.min(t, targetFrames);
-  const out = new Float32Array(1 * frames * N_MEL);
-  for (let i = 0; i < frames; i++) {
-    for (let c = 0; c < N_MEL; c++) {
-      if (c < inDim) out[i * N_MEL + c] = data[i * inDim + c];
-    }
-  }
-  return new ort.Tensor("float32", out, [1, frames, N_MEL]);
-}
 
 /** fm_decoder outputs mel as [1, T, 100]; Vocos wants [1, 100, T]. */
 function transposeMelForVocos(
