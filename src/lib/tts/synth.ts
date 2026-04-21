@@ -7,9 +7,8 @@
 // One call per sentence. Streaming / pipelining is a higher-level
 // concern and happens in the provider.
 
-// Matches browser-inference.ts's direct-path import to ensure one
-// shared WebGPU-enabled bundle across the code. See comment there.
-import * as ort from "onnxruntime-web/dist/ort.webgpu.bundle.min.mjs";
+// Resolved to the WebGPU bundle via next.config.ts's turbopack alias.
+import * as ort from "onnxruntime-web";
 import {
   VOCOS_FREQ_BINS,
   VOCOS_ISTFT_CONFIG,

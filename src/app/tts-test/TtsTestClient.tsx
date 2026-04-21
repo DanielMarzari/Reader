@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import * as ort from "onnxruntime-web/dist/ort.webgpu.bundle.min.mjs";
+import * as ort from "onnxruntime-web";
 import {
   configureOrt,
   defaultSharedAssets,

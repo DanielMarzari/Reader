@@ -29,13 +29,13 @@
 //     download with equivalent speed on CPU/WASM. (FP32 is ~2x faster on
 //     NVIDIA GPUs via WebGPU, but our bug-workaround path is WASM.)
 
-// Direct file-path import of ORT-Web's WebGPU bundle. The package's
-// exports map has a `./webgpu` subpath but Turbopack (Next 16) can't
-// resolve it; the default entry (`onnxruntime-web`) doesn't include
-// the WebGPU backend registration in its bundle. Direct path it is.
-// Type shim in src/types/onnxruntime-web.d.ts declares this module
-// re-exports from "onnxruntime-web" so TS sees the same surface.
-import * as ort from "onnxruntime-web/dist/ort.webgpu.bundle.min.mjs";
+// Plain `onnxruntime-web` import — but next.config.ts's
+// turbopack.resolveAlias redirects it to
+// `onnxruntime-web/dist/ort.webgpu.bundle.min.mjs` (the WebGPU bundle,
+// which actually registers the JSEP backend). The default entry
+// doesn't. Turbopack can't resolve the `./webgpu` subpath from the
+// package's exports map, hence the alias workaround.
+import * as ort from "onnxruntime-web";
 
 // ---------- Config ----------
 

@@ -12,6 +12,19 @@ const nextConfig: NextConfig = {
       "./node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
     ],
   },
+  // ONNX Runtime Web ships multiple bundle variants; the `./webgpu`
+  // subpath registers the WebGPU (JSEP) backend, the default doesn't.
+  // Turbopack (Next 16) can't resolve conditional-exports subpaths
+  // and refuses direct file-path imports into node_modules. The alias
+  // below redirects the default `onnxruntime-web` import to the
+  // WebGPU bundle file so `import * as ort from "onnxruntime-web"`
+  // in our code Just Works and gives us WebGPU backend support.
+  turbopack: {
+    resolveAlias: {
+      "onnxruntime-web":
+        "./node_modules/onnxruntime-web/dist/ort.webgpu.bundle.min.mjs",
+    },
+  },
   // Cross-Origin Isolation headers. Required by onnxruntime-web's WASM
   // backend to enable SharedArrayBuffer, which unlocks multi-threaded
   // inference (~3–4× faster than single-threaded per Spike B's findings).
