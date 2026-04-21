@@ -320,12 +320,12 @@ export async function createSessions(
     return { textEncoder, fmDecoder, vocos, provider: providers[0] };
   };
 
-  try {
-    return await tryProviders(["webgpu", "wasm"]);
-  } catch (e) {
-    console.warn("[tts] WebGPU session creation failed, falling back to WASM:", e);
-    return await tryProviders(["wasm"]);
-  }
+  // WASM only. WebGPU was explored (see Spike B, and the
+  // turbopack.resolveAlias history in git) but hit a known ORT-Web
+  // kernel bug on ZipVoice's Zipformer MatMul. Revisit when ORT-Web
+  // ships the fix or when we pick up the runtime-fallback code path
+  // in Workstream C.
+  return await tryProviders(["wasm"]);
 }
 
 // ---------- Tensor helpers ----------
