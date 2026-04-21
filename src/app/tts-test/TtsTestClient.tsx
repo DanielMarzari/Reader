@@ -38,12 +38,14 @@ const T_SHIFT = 0.5; // ZipVoice default, emphasizes low-SNR region
 
 /** The one hardcoded voice for the dev harness until the UI supports
  *  picking from the Reader voice library. Symlinked into public/tts-assets/
- *  voices/<id>/ by the one-off compute_prompt_mel.py run. */
-const DEFAULT_VOICE_ID = "0e97772fe314"; // Alex
+ *  voices/<id>/ by the one-off compute_prompt_mel.py run.
+ *  Felix (British RP) was Spike D's cleanest zero-shot result — best
+ *  signal for judging Phase 3 quality. */
+const DEFAULT_VOICE_ID = "ef0f1ac1a7e4"; // Felix (8.25s, British RP)
 
 const DEFAULT_TEXT = "The morning light filtered through the kitchen blinds.";
 const DEFAULT_PROMPT_TEXT =
-  "Hello, I can provide conversational narration in English with an authentic European French accent.";
+  "I noticed the old tree had something strange carved into its bark. Symbols, lines that didn't look like they belonged there.";
 
 /** Time-step schedule for the ODE solver. Port of
  *  zipvoice.models.modules.solver.get_time_steps. Returns an array of
