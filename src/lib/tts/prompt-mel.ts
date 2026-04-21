@@ -2,15 +2,18 @@
 //
 // prompt_mel.f32 is a packed little-endian Float32 blob shaped
 // (num_frames, 100), produced server-side by
-// backend/scripts/compute_prompt_mel.py in Voice Studio.
-// prompt_mel_meta.json lives next to it with the concrete num_frames
-// + feat_scale + SHA-256.
+// backend/mel_features.compute_prompt_mel() in Voice Studio (runs
+// automatically as part of /api/clone and is uploaded alongside
+// sample.mp3 to Reader). prompt_mel_meta.json is its small sidecar
+// with num_frames + feat_scale + SHA-256.
 //
-// Both are voice-specific (per-voice-id). They're cached per voice in
-// the same Cache Storage bucket as the ONNX models, so first use pays
-// the ~240 KB download and subsequent synthesis hits the cache.
-
-import { VOICE_ASSET_BASE } from "@/lib/tts/browser-inference";
+// Both are voice-specific. Reader serves them via:
+//   GET /api/voices/<id>/prompt-mel         — Float32 binary
+//   GET /api/voices/<id>/prompt-mel-meta    — JSON sidecar
+//
+// They're cached in the same Cache Storage bucket as the ONNX models,
+// so first use pays the ~240 KB download and subsequent synthesis
+// hits the cache.
 
 const CACHE_NAME = "reader-tts-v2";
 
@@ -43,11 +46,11 @@ export type PromptMelMeta = {
 };
 
 function baseUrl(voiceId: string): string {
-  // Normalize trailing slash
-  const base = VOICE_ASSET_BASE.endsWith("/")
-    ? VOICE_ASSET_BASE.slice(0, -1)
-    : VOICE_ASSET_BASE;
-  return `${base}/${voiceId}`;
+  // Reader's authenticated-ish voice routes, same pattern as
+  // /api/voices/<id>/sample + cover. Route handlers in
+  // src/app/api/voices/[id]/prompt-mel{,-meta}/ read from the
+  // server's voice storage dir.
+  return `/api/voices/${voiceId}`;
 }
 
 /** Fetch the asset (with Cache Storage), verifying it against the
@@ -71,8 +74,8 @@ async function fetchF32Cached(url: string, expectedBytes: number): Promise<Array
 /** Load the prompt_mel for a voice. Resolves after both the meta JSON
  *  and the binary .f32 are in hand + validated. */
 export async function loadPromptMel(voiceId: string): Promise<PromptMel> {
-  const metaUrl = `${baseUrl(voiceId)}/prompt_mel_meta.json`;
-  const dataUrl = `${baseUrl(voiceId)}/prompt_mel.f32`;
+  const metaUrl = `${baseUrl(voiceId)}/prompt-mel-meta`;
+  const dataUrl = `${baseUrl(voiceId)}/prompt-mel`;
 
   const metaResp = await fetch(metaUrl);
   if (!metaResp.ok) {

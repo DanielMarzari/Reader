@@ -22,6 +22,18 @@ export function voiceCoverPath(id: string, ext: string): string {
   return path.join(voiceSampleDir(id), `cover${ext}`);
 }
 
+/** ZipVoice prompt mel spectrogram, Float32 LE (num_frames, 100).
+ *  Uploaded from Voice Studio at clone time; served to the browser
+ *  client as fm_decoder's `speech_condition`. */
+export function voicePromptMelPath(id: string): string {
+  return path.join(voiceSampleDir(id), "prompt_mel.f32");
+}
+
+/** Metadata JSON for the prompt mel (num_frames, feat_scale, etc.). */
+export function voicePromptMelMetaPath(id: string): string {
+  return path.join(voiceSampleDir(id), "prompt_mel_meta.json");
+}
+
 // ---- Voice profile CRUD ----
 
 export type VoiceProfile = {
@@ -33,6 +45,11 @@ export type VoiceProfile = {
   design: Record<string, unknown>;
   hasSample: boolean;
   coverUrl: string | null;
+  /** True iff prompt_mel.f32 + prompt_mel_meta.json exist on disk.
+   *  Browser inference requires both; audiobook / Web-Speech paths
+   *  don't. Computed from filesystem so it's up-to-date even if we
+   *  drop assets in manually. */
+  hasPromptMel: boolean;
 };
 
 function rowTo(p: VoiceProfileRow): VoiceProfile {
@@ -43,6 +60,9 @@ function rowTo(p: VoiceProfileRow): VoiceProfile {
     // Corrupt JSON in storage — surface as empty, don't crash the page.
   }
   const hasCover = Boolean(p.cover_path && fs.existsSync(p.cover_path));
+  const hasPromptMel =
+    fs.existsSync(voicePromptMelPath(p.id)) &&
+    fs.existsSync(voicePromptMelMetaPath(p.id));
   return {
     id: p.id,
     name: p.name,
@@ -52,6 +72,7 @@ function rowTo(p: VoiceProfileRow): VoiceProfile {
     design,
     hasSample: Boolean(p.sample_path && fs.existsSync(p.sample_path)),
     coverUrl: hasCover ? `/api/voices/${p.id}/cover` : null,
+    hasPromptMel,
   };
 }
 
@@ -83,6 +104,14 @@ export function upsertVoiceProfile(args: {
   coverBuffer?: Buffer | null;
   /** Extension for the cover file (e.g. ".png", ".jpg"). */
   coverExt?: string | null;
+  /** ZipVoice prompt log-mel, Float32 LE in time-major (num_frames, 100)
+   *  layout. Required by Reader's browser-inference path. If absent,
+   *  this voice can still play via the audiobook render queue or
+   *  Web Speech fallback. */
+  promptMelBuffer?: Buffer | null;
+  /** JSON sidecar with num_frames, feat_scale, sha256, etc. Must be
+   *  present whenever promptMelBuffer is. */
+  promptMelMetaBuffer?: Buffer | null;
 }): VoiceProfile {
   const db = getDb();
 
@@ -96,6 +125,18 @@ export function upsertVoiceProfile(args: {
   if (args.coverBuffer && args.coverExt) {
     coverPath = voiceCoverPath(args.id, args.coverExt);
     fs.writeFileSync(coverPath, args.coverBuffer);
+  }
+
+  if (args.promptMelBuffer && args.promptMelMetaBuffer) {
+    fs.writeFileSync(voicePromptMelPath(args.id), args.promptMelBuffer);
+    fs.writeFileSync(voicePromptMelMetaPath(args.id), args.promptMelMetaBuffer);
+  } else if (args.promptMelBuffer || args.promptMelMetaBuffer) {
+    // Shipping one without the other is useless; ignore the half-shipment
+    // rather than leaving the voice in an inconsistent state.
+    console.warn(
+      `[voices] ${args.id}: prompt_mel upload had only one of the two ` +
+        `fields; both must be present together. Skipping prompt_mel save.`
+    );
   }
 
   db.prepare(

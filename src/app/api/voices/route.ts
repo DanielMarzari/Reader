@@ -45,6 +45,8 @@ async function handleStudioPush(form: FormData): Promise<Response> {
   const metaRaw = form.get("metadata");
   const sample = form.get("sample");
   const cover = form.get("cover");
+  const promptMel = form.get("prompt_mel");
+  const promptMelMeta = form.get("prompt_mel_meta");
 
   if (typeof metaRaw !== "string") {
     return NextResponse.json({ error: "Missing 'metadata' field" }, { status: 400 });
@@ -119,6 +121,45 @@ async function handleStudioPush(form: FormData): Promise<Response> {
     coverExt = ext;
   }
 
+  // Optional prompt_mel payload. Phase 3: Voice Studio's /api/clone
+  // computes the log-mel spectrogram of the reference audio via
+  // mel_features.compute_prompt_mel and ships it here so Reader can
+  // serve it to the browser client for ZipVoice's `speech_condition`.
+  // Old Voice Studio versions won't send these — voice still works for
+  // audiobook / Web-Speech playback but not browser-native inference.
+  let promptMelBuf: Buffer | null = null;
+  let promptMelMetaBuf: Buffer | null = null;
+  if (promptMel instanceof File && promptMel.size > 0) {
+    // 100 mels × 4 bytes × ~40 frames/second × 60 seconds = 960 KB per
+    // minute. Ceiling of 10 MB covers very long prompt clips (> 2.5 min).
+    if (promptMel.size > 10 * 1024 * 1024) {
+      return NextResponse.json(
+        { error: "prompt_mel too large (max 10 MB)" },
+        { status: 413 }
+      );
+    }
+    promptMelBuf = Buffer.from(await promptMel.arrayBuffer());
+  }
+  if (promptMelMeta instanceof File && promptMelMeta.size > 0) {
+    if (promptMelMeta.size > 16 * 1024) {
+      return NextResponse.json(
+        { error: "prompt_mel_meta too large (max 16 KB — it's a tiny JSON)" },
+        { status: 413 }
+      );
+    }
+    promptMelMetaBuf = Buffer.from(await promptMelMeta.arrayBuffer());
+    // Sanity-check it parses as JSON. Bad JSON now means unusable
+    // prompt_mel later; fail fast.
+    try {
+      JSON.parse(promptMelMetaBuf.toString("utf8"));
+    } catch {
+      return NextResponse.json(
+        { error: "prompt_mel_meta is not valid JSON" },
+        { status: 400 }
+      );
+    }
+  }
+
   try {
     const saved = upsertVoiceProfile({
       id: meta.id,
@@ -130,6 +171,8 @@ async function handleStudioPush(form: FormData): Promise<Response> {
       sampleBuffer: buf,
       coverBuffer: coverBuf,
       coverExt,
+      promptMelBuffer: promptMelBuf,
+      promptMelMetaBuffer: promptMelMetaBuf,
     });
     return NextResponse.json({ voice: saved });
   } catch (err) {
