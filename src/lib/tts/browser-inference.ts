@@ -320,12 +320,25 @@ export async function createSessions(
     return { textEncoder, fmDecoder, vocos, provider: providers[0] };
   };
 
-  // WASM only. WebGPU was explored (see Spike B, and the
-  // turbopack.resolveAlias history in git) but hit a known ORT-Web
-  // kernel bug on ZipVoice's Zipformer MatMul. Revisit when ORT-Web
-  // ships the fix or when we pick up the runtime-fallback code path
-  // in Workstream C.
-  return await tryProviders(["wasm"]);
+  // Try WebGPU first with WASM fallback. ORT-Web's runtime picks the
+  // first EP that loads successfully; WASM covers machines where the
+  // WebGPU adapter isn't available. Re-enabled for ORT-Web 1.24.3
+  // which includes the Split-K MatMul rewrite from 1.24.1 —
+  // expected to fix the Spike B Zipformer kernel crash. If a
+  // regression reappears on WebGPU, the next fix is to switch the
+  // `"webgpu"` entry to an object form with `forceCpuNodeNames`:
+  //   { name: "webgpu", forceCpuNodeNames: ["/text_encoder/.../MatMul"] }
+  // This pins the failing node(s) to CPU while keeping WebGPU for
+  // the rest of the graph.
+  try {
+    return await tryProviders(["webgpu", "wasm"]);
+  } catch (e) {
+    console.warn(
+      "[tts] WebGPU session creation failed, falling back to WASM-only:",
+      e
+    );
+    return await tryProviders(["wasm"]);
+  }
 }
 
 // ---------- Tensor helpers ----------
