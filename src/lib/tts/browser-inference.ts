@@ -44,8 +44,9 @@ export const VOICE_ASSET_BASE =
   process.env.NEXT_PUBLIC_TTS_VOICE_BASE ?? "/tts-assets/voices";
 
 /** Cache Storage name for TTS blobs. Bumping this key invalidates
- *  every cached model — use for big version jumps. */
-const CACHE_NAME = "reader-tts-v1";
+ *  every cached model — use for big version jumps. v2 adds FP32 as
+ *  the default precision. */
+const CACHE_NAME = "reader-tts-v2";
 
 /** Where ORT-Web loads its own WASM backend + threaded worker from.
  *
@@ -232,10 +233,27 @@ export type SharedAssets = {
   modelJsonUrl: string;
 };
 
-export function defaultSharedAssets(): SharedAssets {
+/** Which precision variant of each model to ship. INT8 is ~4× smaller
+ *  download (119 MB vs 455 MB for fm_decoder) but noticeably degrades
+ *  zero-shot voice quality — Dan A/B'd FP32 against Spike D's Felix-
+ *  GREEN reference and INT8 lost detail / clarity. We default to FP32
+ *  for quality; revisit INT8 once we have threading + WebGPU kernel
+ *  wins closing the speed gap (INT8 would save ~5-10 seconds on first
+ *  load but nothing on subsequent Cache Storage hits).
+ *
+ *  Vocos stays FP16 — parity vs PyTorch FP32 is 6.5e-5 RMS, audibly
+ *  indistinguishable (see backend/data/models/vocos_meta.json in the
+ *  Voice repo). */
+export type PrecisionVariant = "fp32" | "int8";
+export const DEFAULT_PRECISION: PrecisionVariant = "fp32";
+
+export function defaultSharedAssets(
+  precision: PrecisionVariant = DEFAULT_PRECISION
+): SharedAssets {
+  const suffix = precision === "int8" ? "_int8" : "";
   return {
-    fmDecoderUrl: `${SHARED_ASSET_BASE}/fm_decoder_int8.onnx`,
-    textEncoderUrl: `${SHARED_ASSET_BASE}/text_encoder_int8.onnx`,
+    fmDecoderUrl: `${SHARED_ASSET_BASE}/fm_decoder${suffix}.onnx`,
+    textEncoderUrl: `${SHARED_ASSET_BASE}/text_encoder${suffix}.onnx`,
     vocosUrl: `${SHARED_ASSET_BASE}/vocos_fp16.onnx`,
     tokensUrl: `${SHARED_ASSET_BASE}/tokens.txt`,
     modelJsonUrl: `${SHARED_ASSET_BASE}/model.json`,

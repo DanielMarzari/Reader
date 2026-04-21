@@ -12,7 +12,7 @@
 
 import { VOICE_ASSET_BASE } from "@/lib/tts/browser-inference";
 
-const CACHE_NAME = "reader-tts-v1";
+const CACHE_NAME = "reader-tts-v2";
 
 export type PromptMel = {
   voiceId: string;
