@@ -320,12 +320,23 @@ export async function createSessions(
     return { textEncoder, fmDecoder, vocos, provider: providers[0] };
   };
 
-  // WASM only. WebGPU was explored (see Spike B, and the
-  // turbopack.resolveAlias history in git) but hit a known ORT-Web
-  // kernel bug on ZipVoice's Zipformer MatMul. Revisit when ORT-Web
-  // ships the fix or when we pick up the runtime-fallback code path
-  // in Workstream C.
-  return await tryProviders(["wasm"]);
+  // Try WebGPU first, fall back to WASM if session creation fails
+  // (no WebGPU adapter, known Zipformer kernel bug, or anything
+  // else). On ORT-Web 1.23.2 — picked as a middle-ground above
+  // 1.19.2 (where the kernel bug bit) and below 1.24.3 (which
+  // fails at module load under Turbopack). If 1.23's op coverage
+  // has advanced past the 1.19 Zipformer MatMul bug, WebGPU will
+  // load and run end-to-end. Otherwise we silently WASM-fallback
+  // and stay at the B9 baseline.
+  try {
+    return await tryProviders(["webgpu", "wasm"]);
+  } catch (e) {
+    console.warn(
+      "[tts] WebGPU session creation failed, falling back to WASM-only:",
+      e
+    );
+    return await tryProviders(["wasm"]);
+  }
 }
 
 // ---------- Tensor helpers ----------

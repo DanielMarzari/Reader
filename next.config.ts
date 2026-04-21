@@ -12,20 +12,26 @@ const nextConfig: NextConfig = {
       "./node_modules/pdfjs-dist/legacy/build/pdf.worker.js",
     ],
   },
-  // ONNX Runtime Web — we use the DEFAULT bundle (WASM only; no
-  // WebGPU). An earlier turbopack.resolveAlias redirected to the
-  // WebGPU bundle, but that surfaced the known ORT-Web kernel bug
-  // from Spike B (conv_module1/out_proj/MatMul "shared dimension
-  // does not match") on ZipVoice's Zipformer. WASM backend has
-  // working kernels for the same graph.
+  // ONNX Runtime Web — the `./webgpu` subpath ships the JSEP bundle
+  // that registers the WebGPU backend. The default entry does NOT,
+  // and Turbopack 16 can't resolve conditional-exports subpaths, so
+  // we alias the bare `onnxruntime-web` specifier to the WebGPU
+  // bundle file directly.
   //
-  // Spike B (phase-0-spikes branch, commit 3f05684) already measured
-  // this WASM path: single-threaded 0.57× real-time, known-good.
-  // Multi-threaded WASM (would need proxy + SharedArrayBuffer) is
-  // a separate Workstream C optimization.
+  // On 1.23.2 (B12). 1.24.3 had the same alias but failed at module
+  // load under Turbopack — its bundle self-locates via a top-level
+  // `new URL(..., import.meta.url)` that Turbopack can't resolve.
+  // 1.23.2 predates that change, so this alias should load cleanly.
   //
-  // Revisit: ORT-Web 1.22+ (we're on 1.19.2) may have the kernel
-  // fix; retest WebGPU then. Until then, WASM is the contract.
+  // If WebGPU still fails at runtime (same Zipformer MatMul shape
+  // bug Spike B hit on 1.19.2), WASM remains as fallback — see
+  // `createSessions` in src/lib/tts/browser-inference.ts.
+  turbopack: {
+    resolveAlias: {
+      "onnxruntime-web":
+        "./node_modules/onnxruntime-web/dist/ort.webgpu.bundle.min.mjs",
+    },
+  },
   // Cross-Origin Isolation headers. Required by onnxruntime-web's WASM
   // backend to enable SharedArrayBuffer, which unlocks multi-threaded
   // inference (~3–4× faster than single-threaded per Spike B's findings).
