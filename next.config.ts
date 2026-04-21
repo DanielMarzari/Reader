@@ -18,10 +18,14 @@ const nextConfig: NextConfig = {
   // we alias the bare `onnxruntime-web` specifier to the WebGPU
   // bundle file directly.
   //
-  // On 1.23.2 (B12). 1.24.3 had the same alias but failed at module
-  // load under Turbopack — its bundle self-locates via a top-level
-  // `new URL(..., import.meta.url)` that Turbopack can't resolve.
-  // 1.23.2 predates that change, so this alias should load cleanly.
+  // On 1.21.1 (B13). Higher versions (1.22.0+) fail at module load
+  // under Turbopack — their bundles use `import.meta.url` in
+  // top-level expressions beyond a simple variable capture (1.22
+  // adds a comparison `import.meta.url>"file:"`, 1.24 goes further).
+  // Under Turbopack 16 `import.meta.url` is rewritten to a string
+  // that fails URL parsing, so module eval throws "Invalid URL"
+  // before we ever create a session. 1.21.1 uses only the same
+  // safe pattern as 1.19.2 and should load cleanly.
   //
   // If WebGPU still fails at runtime (same Zipformer MatMul shape
   // bug Spike B hit on 1.19.2), WASM remains as fallback — see

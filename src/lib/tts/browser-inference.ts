@@ -322,12 +322,13 @@ export async function createSessions(
 
   // Try WebGPU first, fall back to WASM if session creation fails
   // (no WebGPU adapter, known Zipformer kernel bug, or anything
-  // else). On ORT-Web 1.23.2 — picked as a middle-ground above
-  // 1.19.2 (where the kernel bug bit) and below 1.24.3 (which
-  // fails at module load under Turbopack). If 1.23's op coverage
-  // has advanced past the 1.19 Zipformer MatMul bug, WebGPU will
-  // load and run end-to-end. Otherwise we silently WASM-fallback
-  // and stay at the B9 baseline.
+  // else). On ORT-Web 1.21.1 — the highest version that still
+  // loads under Turbopack (1.22+ introduces eager `import.meta.url`
+  // patterns at module top-level that Turbopack can't rewrite).
+  // Gamble: did JSEP op-coverage between 1.19 and 1.21 fix the
+  // Zipformer MatMul "shared dimension does not match" kernel bug
+  // incidentally? If yes, WebGPU runs end-to-end. If no, we WASM-
+  // fallback silently and stay at the B9 baseline.
   try {
     return await tryProviders(["webgpu", "wasm"]);
   } catch (e) {
