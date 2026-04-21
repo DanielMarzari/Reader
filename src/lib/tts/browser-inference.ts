@@ -29,7 +29,18 @@
 //     download with equivalent speed on CPU/WASM. (FP32 is ~2x faster on
 //     NVIDIA GPUs via WebGPU, but our bug-workaround path is WASM.)
 
-import * as ort from "onnxruntime-web";
+// Use the `webgpu` subpath explicitly — ORT-Web 1.19's default entry
+// (`onnxruntime-web`) doesn't guarantee the WebGPU backend gets
+// registered, which surfaced as the browser-console warning
+//
+//   "removing requested execution provider 'webgpu' from session
+//    options because it is not available: backend not found"
+//
+// followed by a silent WASM fallback (~3× slower). The `/webgpu`
+// subpath bundles the JSEP backend + all WebGPU kernel registrations.
+// Falls back to WASM automatically if the adapter is unavailable at
+// runtime.
+import * as ort from "onnxruntime-web/webgpu";
 
 // ---------- Config ----------
 
@@ -67,14 +78,17 @@ let _ortConfigured = false;
  *  creating the first InferenceSession. */
 export function configureOrt() {
   if (_ortConfigured) return;
-  // Tell ORT where to find ort-wasm-simd-threaded.{mjs,wasm} — the
-  // object form binds each file explicitly so Turbopack's bundling
-  // of the main ORT module can't mangle the resolution. See the
-  // `copy-ort-wasm` npm script for how these files land in /public.
-  ort.env.wasm.wasmPaths = {
-    mjs: `${ORT_DIST_BASE}ort-wasm-simd-threaded.mjs`,
-    wasm: `${ORT_DIST_BASE}ort-wasm-simd-threaded.wasm`,
-  };
+  // String prefix form: ORT appends the right filename for whichever
+  // backend it's loading — `ort-wasm-simd-threaded.jsep.{mjs,wasm}` for
+  // WebGPU (JSEP), `ort-wasm-simd-threaded.{mjs,wasm}` for plain WASM.
+  //
+  // We tried the object form earlier (keys `mjs` + `wasm`) to dodge
+  // a Turbopack resolution issue, but that binds ORT to ONE set of
+  // files — so when WebGPU was requested, ORT loaded the non-JSEP
+  // backend and silently fell back to WASM. Back to the prefix form
+  // now that `proxy = false` dodges the worker-creation path that
+  // originally caused the Turbopack issue.
+  ort.env.wasm.wasmPaths = ORT_DIST_BASE;
 
   // Single-threaded on main thread. Known-good config; we pay the
   // Spike-B pessimistic WASM numbers (~0.6× RT) in exchange for dodging

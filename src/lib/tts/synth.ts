@@ -7,7 +7,10 @@
 // One call per sentence. Streaming / pipelining is a higher-level
 // concern and happens in the provider.
 
-import * as ort from "onnxruntime-web";
+// Must match the import subpath in browser-inference.ts — ORT-Web's
+// type Tensor is the same either way, but we want the `webgpu` bundle
+// loaded once, shared across modules.
+import * as ort from "onnxruntime-web/webgpu";
 import {
   VOCOS_FREQ_BINS,
   VOCOS_ISTFT_CONFIG,
