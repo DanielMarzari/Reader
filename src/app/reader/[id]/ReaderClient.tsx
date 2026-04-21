@@ -1,13 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { TTSProvider } from "@/components/tts/TTSContext";
 import { AudiobookProvider } from "@/components/tts/AudiobookProvider";
+import { BrowserInferenceProvider } from "@/components/tts/BrowserInferenceProvider";
 import { TTSContent } from "@/components/tts/TTSContent";
 import { TTSPlayerBar } from "@/components/tts/TTSPlayerBar";
 import { PdfPagesViewer } from "@/components/PdfPagesViewer";
 import { QueueVoiceButton } from "@/components/QueueVoiceButton";
+import type { ReaderVoice } from "@/types/voice";
 import {
   SettingsDrawer,
   applyTheme,
@@ -61,10 +63,51 @@ export function ReaderClient({
   const [hydrated, setHydrated] = useState(false);
 
   // When the user picks an audiobook, we fetch its manifest + mount
-  // <AudiobookProvider/> instead of <TTSProvider/>. null = use browser engine.
+  // <AudiobookProvider/> instead of <TTSProvider/>. null = use browser
+  // inference (if voice has prompt_mel) or the Web Speech fallback.
   const [audiobookVoiceId, setAudiobookVoiceId] = useState<string | null>(null);
   const [audiobookManifest, setAudiobookManifest] = useState<AudiobookManifest | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
+
+  // Voice library — Reader-wide list of available voices. We load once
+  // in the ReaderClient (not inside TTSProvider) so the page can decide
+  // WHICH provider to mount based on the selected voice's
+  // `hasPromptMel`. The mounted provider still owns the current
+  // voiceId; we just need enough data to pick between providers.
+  const [voices, setVoices] = useState<ReaderVoice[] | null>(null);
+  const [voicesLoading, setVoicesLoading] = useState(true);
+  const [browserVoiceId, setBrowserVoiceId] = useState<string | null>(
+    initialVoiceName
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/voices")
+      .then((r) => r.json())
+      .then((d: { voices: ReaderVoice[] }) => {
+        if (!cancelled) setVoices(d.voices);
+      })
+      .catch(() => {
+        if (!cancelled) setVoices([]);
+      })
+      .finally(() => {
+        if (!cancelled) setVoicesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** If a voice is currently selected AND it has prompt_mel available
+   *  AND no audiobook is chosen → mount BrowserInferenceProvider. */
+  const browserVoice = useMemo<ReaderVoice | null>(() => {
+    if (audiobookVoiceId) return null;
+    if (!voices || !browserVoiceId) return null;
+    const v = voices.find(
+      (v) => v.id === browserVoiceId || v.name === browserVoiceId
+    );
+    return v?.hasPromptMel ? v : null;
+  }, [voices, browserVoiceId, audiobookVoiceId]);
 
   const pagesAvailable = sourceType === "pdf";
 
@@ -166,9 +209,18 @@ export function ReaderClient({
     </>
   );
 
-  // When an audiobook is selected + its manifest is loaded, mount the
-  // audiobook provider; otherwise the browser TTS provider. Swapping
-  // providers tears down the previous playback cleanly (provider unmount).
+  // Three-way provider selection, in preference order:
+  //
+  //   1. AudiobookProvider  — explicit pre-rendered MP3 chunks via
+  //      the QueueVoiceButton ("Queue / Listen with…" flow).
+  //   2. BrowserInferenceProvider — ZipVoice-Distill running locally
+  //      in the browser. Requires the voice to have `hasPromptMel`
+  //      (Voice Studio's Clone endpoint ships prompt_mel.f32).
+  //   3. TTSProvider — Web Speech API fallback, always works but uses
+  //      the OS default voice (no cloning).
+  //
+  // Swapping providers tears down the previous playback cleanly via
+  // the provider's unmount effect.
   if (audiobookVoiceId && audiobookManifest) {
     return (
       <AudiobookProvider
@@ -188,6 +240,28 @@ export function ReaderClient({
           )}
         </div>
       </AudiobookProvider>
+    );
+  }
+
+  if (browserVoice && voices) {
+    return (
+      <BrowserInferenceProvider
+        docId={docId}
+        content={content}
+        voiceId={browserVoice.id}
+        selectedVoice={browserVoice}
+        voices={voices}
+        voicesLoading={voicesLoading}
+        initialCharIndex={initialCharIndex}
+        initialRate={initialRate}
+        clickToListen={settings.clickToListen}
+        onVoiceChange={setBrowserVoiceId}
+      >
+        <div className="min-h-screen flex flex-col">
+          {nav}
+          {body}
+        </div>
+      </BrowserInferenceProvider>
     );
   }
 
