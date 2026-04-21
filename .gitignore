@@ -38,6 +38,11 @@ next-env.d.ts
 # uploads
 /uploads
 
+# Runtime voice storage — populated by /api/voices POST (Voice Studio
+# pushes sample.mp3 + prompt_mel.f32 + prompt_mel_meta.json here per
+# voice). User-specific, belongs outside git.
+/storage
+
 # TTS model assets — served from public/tts-assets/shared/ in dev (via
 # symlink to the Voice repo's local copies). In prod they live at
 # /shared/ on Oracle. Never commit the .onnx files to Reader — they're
