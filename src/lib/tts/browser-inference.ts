@@ -29,14 +29,13 @@
 //     download with equivalent speed on CPU/WASM. (FP32 is ~2x faster on
 //     NVIDIA GPUs via WebGPU, but our bug-workaround path is WASM.)
 
-// onnxruntime-web default entry — Next 16 / Turbopack doesn't resolve
-// the "onnxruntime-web/webgpu" subpath even though it's declared in
-// the package's conditional exports. The default bundle
-// (ort.bundle.min.mjs) includes the WebGPU/JSEP backend anyway; the
-// real WebGPU-registration fix is the string-prefix wasmPaths below
-// which lets ORT pick ort-wasm-simd-threaded.jsep.{mjs,wasm} when the
-// WebGPU backend loads.
-import * as ort from "onnxruntime-web";
+// Direct file-path import of ORT-Web's WebGPU bundle. The package's
+// exports map has a `./webgpu` subpath but Turbopack (Next 16) can't
+// resolve it; the default entry (`onnxruntime-web`) doesn't include
+// the WebGPU backend registration in its bundle. Direct path it is.
+// Type shim in src/types/onnxruntime-web.d.ts declares this module
+// re-exports from "onnxruntime-web" so TS sees the same surface.
+import * as ort from "onnxruntime-web/dist/ort.webgpu.bundle.min.mjs";
 
 // ---------- Config ----------
 

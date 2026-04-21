@@ -7,9 +7,9 @@
 // One call per sentence. Streaming / pipelining is a higher-level
 // concern and happens in the provider.
 
-// Matches browser-inference.ts's default-entry import. See comment
-// there for why we can't use the /webgpu subpath under Turbopack.
-import * as ort from "onnxruntime-web";
+// Matches browser-inference.ts's direct-path import to ensure one
+// shared WebGPU-enabled bundle across the code. See comment there.
+import * as ort from "onnxruntime-web/dist/ort.webgpu.bundle.min.mjs";
 import {
   VOCOS_FREQ_BINS,
   VOCOS_ISTFT_CONFIG,
