@@ -43,3 +43,10 @@ next-env.d.ts
 # /shared/ on Oracle. Never commit the .onnx files to Reader — they're
 # the output of Phase 1's Voice Studio scripts and belong to that repo.
 /public/tts-assets
+
+# ORT-Web's WASM backend + threaded worker are copied into public/ort/
+# by `npm run copy-ort-wasm` (runs via pre-dev / pre-build). Source
+# lives in node_modules/onnxruntime-web/dist/; we mirror it same-origin
+# so cross-origin isolation (COOP/COEP) can load them without CORP
+# edge cases.
+/public/ort

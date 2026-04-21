@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "npm run copy-pdf-worker && next dev",
-    "build": "npm run copy-pdf-worker && next build",
+    "dev": "npm run copy-pdf-worker && npm run copy-ort-wasm && next dev",
+    "build": "npm run copy-pdf-worker && npm run copy-ort-wasm && next build",
     "start": "next start",
     "lint": "eslint",
-    "copy-pdf-worker": "node -e \"const fs=require('fs');const p=require.resolve('pdfjs-dist/build/pdf.worker.mjs');fs.mkdirSync('public',{recursive:true});fs.copyFileSync(p,'public/pdf.worker.mjs');console.log('copied pdfjs worker →','public/pdf.worker.mjs');\""
+    "copy-pdf-worker": "node -e \"const fs=require('fs');const p=require.resolve('pdfjs-dist/build/pdf.worker.mjs');fs.mkdirSync('public',{recursive:true});fs.copyFileSync(p,'public/pdf.worker.mjs');console.log('copied pdfjs worker →','public/pdf.worker.mjs');\"",
+    "copy-ort-wasm": "node -e \"const fs=require('fs'),p=require('path');const src=p.dirname(require.resolve('onnxruntime-web'));const dst='public/ort';fs.mkdirSync(dst,{recursive:true});const files=['ort-wasm-simd-threaded.wasm','ort-wasm-simd-threaded.mjs','ort-wasm-simd-threaded.jsep.wasm','ort-wasm-simd-threaded.jsep.mjs'];for(const f of files){fs.copyFileSync(p.join(src,f),p.join(dst,f));}console.log('copied',files.length,'ort-web wasm files to',dst);\""
   },
   "dependencies": {
     "better-sqlite3": "^12.8.0",

@@ -47,10 +47,16 @@ export const VOICE_ASSET_BASE =
  *  every cached model — use for big version jumps. */
 const CACHE_NAME = "reader-tts-v1";
 
-/** Where to fetch ORT-Web's own WASM/JS worker files from. jsdelivr is
- *  CDN-cached and ORT-Web's build system matches its own version there. */
-const ORT_DIST_BASE =
-  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+/** Where ORT-Web loads its own WASM backend + threaded worker from.
+ *
+ *  Was jsdelivr, but under COEP: require-corp the browser rejected one
+ *  of ORT's own cross-origin fetches (the threaded worker proxy, which
+ *  loads the .wasm via a dynamic fetch inside the worker context that
+ *  doesn't inherit the main document's COEP trust). Hosting these few
+ *  files same-origin from /ort/ sidesteps every cross-origin-isolation
+ *  edge case. npm scripts in package.json copy the files from
+ *  node_modules/onnxruntime-web/dist/ to public/ort/ on dev/build. */
+const ORT_DIST_BASE = "/ort/";
 
 // ---------- ORT environment init ----------
 
