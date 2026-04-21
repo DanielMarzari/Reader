@@ -66,22 +66,22 @@ let _ortConfigured = false;
  *  creating the first InferenceSession. */
 export function configureOrt() {
   if (_ortConfigured) return;
-  // WASM assets (worker + .wasm backend + proxy.js) all resolve relative
-  // to this base URL. Must end in /.
-  ort.env.wasm.wasmPaths = ORT_DIST_BASE;
+  // Tell ORT where to find ort-wasm-simd-threaded.{mjs,wasm} — the
+  // object form binds each file explicitly so Turbopack's bundling
+  // of the main ORT module can't mangle the resolution. See the
+  // `copy-ort-wasm` npm script for how these files land in /public.
+  ort.env.wasm.wasmPaths = {
+    mjs: `${ORT_DIST_BASE}ort-wasm-simd-threaded.mjs`,
+    wasm: `${ORT_DIST_BASE}ort-wasm-simd-threaded.wasm`,
+  };
 
-  // Multi-threaded WASM requires SharedArrayBuffer, which requires
-  // cross-origin isolation (COOP/COEP headers — see next.config.ts).
-  // When isolation isn't satisfied, ORT falls back to single-threaded
-  // automatically. The `numThreads` setting is an upper bound; the
-  // runtime picks the actual count based on `navigator.hardwareConcurrency`.
-  if (typeof SharedArrayBuffer !== "undefined") {
-    ort.env.wasm.numThreads = Math.min(
-      8,
-      navigator.hardwareConcurrency || 4
-    );
-    ort.env.wasm.proxy = true; // run WASM in a worker to not block UI
-  }
+  // Single-threaded on main thread. Known-good config; we pay the
+  // Spike-B pessimistic WASM numbers (~0.6× RT) in exchange for dodging
+  // the Turbopack + worker-proxy + `import.meta.url` fight that costs
+  // us an entire day of plumbing otherwise. Revisit threading after
+  // the full pipeline is proven end-to-end.
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = false;
 
   _ortConfigured = true;
 }
