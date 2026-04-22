@@ -142,6 +142,22 @@ export function ReaderClient({
     setHydrated(true);
   }, [pagesAvailable]);
 
+  // Register the TTS service worker once on reader mount. It
+  // precaches the onnxruntime-web WASM backend (~32 MB) + tokens.txt
+  // + model.json so cold-start round-trips vanish. Register on the
+  // reader page specifically because that's where we first care about
+  // ORT assets — the library home page doesn't load them. Fire-and-
+  // forget; SW failure is non-fatal (we just lose the precache).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker
+      .register("/sw.js", { scope: "/" })
+      .catch((err) => {
+        console.warn("[Reader] SW registration failed:", err);
+      });
+  }, []);
+
   function onSettingsChange(next: ReaderSettings) {
     setSettings(next);
     saveSettings(next);
