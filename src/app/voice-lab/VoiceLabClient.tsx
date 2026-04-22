@@ -13,6 +13,11 @@ type VoiceProfile = {
   design: Record<string, unknown> & { colors?: string[] | null };
   hasSample: boolean;
   coverUrl: string | null;
+  /** Flag from /api/voices — true iff prompt_mel.f32 + prompt_mel_meta.json
+   *  exist on disk. Determines whether Reader can synthesize this voice
+   *  locally in the browser (Phase 3 path) or falls through to the
+   *  audiobook render queue / Web Speech fallback. */
+  hasPromptMel: boolean;
 };
 
 export function VoiceLabClient() {
@@ -185,6 +190,7 @@ function VoiceCard({
       <div className="mt-4">
         <div className="font-medium">{voice.name}</div>
         <div className="text-xs text-[color:var(--muted)] mt-0.5">{subtitle}</div>
+        <CapabilityBadge hasPromptMel={voice.hasPromptMel} />
       </div>
       {playing && voice.hasSample && (
         <audio
@@ -201,6 +207,40 @@ function VoiceCard({
       >
         Delete
       </button>
+    </div>
+  );
+}
+
+/** Small pill under each voice card communicating which synthesis path
+ *  Reader will use. A voice with prompt_mel attached runs through the
+ *  Phase 3 ZipVoice/WebGPU pipeline directly in the user's browser;
+ *  everything else falls through to the audiobook render queue or the
+ *  built-in Web Speech fallback. */
+function CapabilityBadge({ hasPromptMel }: { hasPromptMel: boolean }) {
+  if (hasPromptMel) {
+    return (
+      <div
+        className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20"
+        title="This voice can run locally in your browser (ZipVoice + WebGPU) on a supported desktop."
+      >
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+        </svg>
+        Local-ready
+      </div>
+    );
+  }
+  return (
+    <div
+      className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-[color:var(--surface-2)] text-[color:var(--muted)] border border-[color:var(--border)]"
+      title="Uses the audiobook render queue or the Web Speech fallback. Re-clone in Voice Studio to make it local-ready."
+    >
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        <path d="M9 18V5l12-2v13" />
+        <circle cx="6" cy="18" r="3" />
+        <circle cx="18" cy="16" r="3" />
+      </svg>
+      Queue-only
     </div>
   );
 }
