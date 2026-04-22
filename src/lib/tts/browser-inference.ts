@@ -393,14 +393,24 @@ export type TtsSessions = {
   provider: "webgpu" | "wasm";
 };
 
+/** Voice-load phases the UI cares about. "downloading" is covered by
+ *  per-asset byte progress; "compiling" is the silent 3–5 s window
+ *  where ORT is parsing the ONNX graph + compiling WebGPU shaders +
+ *  allocating buffers — no progress events are available for it, so
+ *  we just signal the phase transition. */
+export type CreateSessionsPhase = "downloading" | "compiling";
+
 /** Load all three ONNX sessions. Tries WebGPU first on all three; if
  *  ANY of them fail to create or we hit the known Zipformer kernel bug,
  *  we rebuild the whole set on WASM. */
 export async function createSessions(
   shared: SharedAssets,
-  onProgress?: OnProgress
+  onProgress?: OnProgress,
+  onPhase?: (phase: CreateSessionsPhase) => void
 ): Promise<TtsSessions> {
   configureOrt();
+
+  onPhase?.("downloading");
 
   // Fetch all three ONNX blobs in parallel.
   const [textEncoderBuf, fmDecoderBuf, vocosBuf] = await Promise.all([
@@ -408,6 +418,11 @@ export async function createSessions(
     fetchCachedWithProgress(shared.fmDecoderUrl, onProgress),
     fetchCachedWithProgress(shared.vocosUrl, onProgress),
   ]);
+
+  // All bytes are in RAM. Next: ORT graph compile — ~3–5 s silent wait
+  // on WebGPU (shader compile + memory alloc). Signal the phase change
+  // so the UI can swap "Downloading…" for "Preparing voice engine…".
+  onPhase?.("compiling");
 
   const tryProviders = async (
     providers: Array<"webgpu" | "wasm">

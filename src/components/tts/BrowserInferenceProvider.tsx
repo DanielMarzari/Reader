@@ -31,7 +31,10 @@ import {
 } from "@/lib/tts/voice-bundle";
 import { synthesizeSentence } from "@/lib/tts/synth";
 import { VOCOS_ISTFT_CONFIG } from "@/lib/tts/istft";
-import type { DownloadProgress } from "@/lib/tts/browser-inference";
+import type {
+  DownloadProgress,
+  CreateSessionsPhase,
+} from "@/lib/tts/browser-inference";
 
 // ---------- Module-level sentence sample cache ----------
 //
@@ -88,7 +91,15 @@ const WORDS_PER_SECOND = 2.5;
 
 export type BrowserInferenceProviderStatus =
   | { kind: "idle" }
-  | { kind: "loading-voice"; progress: Record<string, DownloadProgress> }
+  | {
+      kind: "loading-voice";
+      progress: Record<string, DownloadProgress>;
+      /** "downloading" until all three ONNX buffers are in memory, then
+       *  flips to "compiling" while ORT builds InferenceSessions. The
+       *  compile phase has no byte progress but takes 3–5 s on a fresh
+       *  load, so we surface it separately in the chip. */
+      phase: CreateSessionsPhase;
+    }
   | { kind: "voice-error"; message: string }
   | { kind: "ready" };
 
@@ -141,7 +152,11 @@ export function BrowserInferenceProvider({
     if (bundle && bundle.voiceId === voiceId) return;
     const promptText =
       (selectedVoice.design.prompt_text as string | undefined) ?? "";
-    setProviderStatus({ kind: "loading-voice", progress: {} });
+    setProviderStatus({
+      kind: "loading-voice",
+      progress: {},
+      phase: "downloading",
+    });
     setBundle(null);
     loadVoiceBundle({
       voiceId,
@@ -153,7 +168,16 @@ export function BrowserInferenceProvider({
             ? {
                 kind: "loading-voice",
                 progress: { ...prev.progress, [p.url]: p },
+                phase: prev.phase,
               }
+            : prev
+        );
+      },
+      onPhase: (phase) => {
+        if (cancelled) return;
+        setProviderStatus((prev) =>
+          prev.kind === "loading-voice"
+            ? { kind: "loading-voice", progress: prev.progress, phase }
             : prev
         );
       },
@@ -632,7 +656,10 @@ export function BrowserInferenceProvider({
   return (
     <TTSContext.Provider value={value}>
       {providerStatus.kind === "loading-voice" && (
-        <LoadProgress progress={providerStatus.progress} />
+        <LoadProgress
+          progress={providerStatus.progress}
+          phase={providerStatus.phase}
+        />
       )}
       {providerStatus.kind === "voice-error" && (
         <VoiceLoadError message={providerStatus.message} voiceId={voiceId} />
@@ -659,24 +686,39 @@ export function BrowserInferenceProvider({
 
 function LoadProgress({
   progress,
+  phase,
 }: {
   progress: Record<string, DownloadProgress>;
+  phase: CreateSessionsPhase;
 }) {
   const items = Object.values(progress);
   const total = items.reduce((s, p) => s + (p.bytesTotal ?? 0), 0);
   const received = items.reduce((s, p) => s + p.bytesReceived, 0);
   const pct = total > 0 ? Math.floor((received / total) * 100) : null;
+  const compiling = phase === "compiling";
   return (
     <div className="fixed bottom-4 right-4 z-50 rounded-xl border border-slate-700 bg-slate-900/90 backdrop-blur px-4 py-3 text-xs text-slate-100 shadow-lg max-w-sm">
-      <div className="font-semibold mb-1">Preparing voice…</div>
-      <div className="text-slate-400">
-        {(received / 1024 / 1024).toFixed(1)} MB
-        {total > 0 && ` / ${(total / 1024 / 1024).toFixed(1)} MB`}
-        {pct != null && ` · ${pct}%`}
+      <div className="font-semibold mb-1 flex items-center gap-2">
+        {compiling && (
+          <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+        )}
+        {compiling ? "Warming up voice engine…" : "Preparing voice…"}
       </div>
+      {compiling ? (
+        <div className="text-slate-400">
+          Compiling ONNX graphs on WebGPU
+        </div>
+      ) : (
+        <div className="text-slate-400">
+          {(received / 1024 / 1024).toFixed(1)} MB
+          {total > 0 && ` / ${(total / 1024 / 1024).toFixed(1)} MB`}
+          {pct != null && ` · ${pct}%`}
+        </div>
+      )}
       <div className="mt-2 text-[10px] text-slate-500">
-        One-time download of the ZipVoice model bundle. Cached for next
-        visit.
+        {compiling
+          ? "One-time per session. Subsequent sentences run instantly."
+          : "One-time download of the ZipVoice model bundle. Cached for next visit."}
       </div>
     </div>
   );

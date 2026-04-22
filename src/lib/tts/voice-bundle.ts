@@ -31,6 +31,7 @@ import {
   defaultSharedAssets,
   type TtsSessions,
   type DownloadProgress,
+  type CreateSessionsPhase,
 } from "@/lib/tts/browser-inference";
 import { ZipVoiceTokenizer } from "@/lib/tts/tokenizer";
 import { loadPromptMel, type PromptMel } from "@/lib/tts/prompt-mel";
@@ -57,16 +58,19 @@ let _sharedSessionsPromise: Promise<TtsSessions> | null = null;
 let _tokenizerPromise: Promise<ZipVoiceTokenizer> | null = null;
 
 function getSharedSessions(
-  onProgress?: (p: DownloadProgress) => void
+  onProgress?: (p: DownloadProgress) => void,
+  onPhase?: (phase: CreateSessionsPhase) => void
 ): Promise<TtsSessions> {
   if (!_sharedSessionsPromise) {
     configureOrt();
     const shared = defaultSharedAssets();
-    _sharedSessionsPromise = createSessions(shared, onProgress).catch((err) => {
-      // Reset on failure so a retry can start fresh.
-      _sharedSessionsPromise = null;
-      throw err;
-    });
+    _sharedSessionsPromise = createSessions(shared, onProgress, onPhase).catch(
+      (err) => {
+        // Reset on failure so a retry can start fresh.
+        _sharedSessionsPromise = null;
+        throw err;
+      }
+    );
   }
   return _sharedSessionsPromise;
 }
@@ -91,6 +95,11 @@ export type LoadVoiceBundleArgs = {
    *  Phase 3 inference requires a prompt transcript. */
   promptText: string;
   onProgress?: (p: DownloadProgress) => void;
+  /** Fires as the ORT session pipeline moves between "downloading" and
+   *  "compiling" phases. The compile phase is silent (no byte progress)
+   *  but takes 3–5 s on a fresh load — without this signal the progress
+   *  chip hits 100 % and disappears while the user still waits. */
+  onPhase?: (phase: CreateSessionsPhase) => void;
 };
 
 /** Build + cache a VoiceBundle. Subsequent calls for the same voice id
@@ -99,6 +108,7 @@ export function loadVoiceBundle({
   voiceId,
   promptText,
   onProgress,
+  onPhase,
 }: LoadVoiceBundleArgs): Promise<VoiceBundle> {
   const cached = _voiceBundles.get(voiceId);
   if (cached) return cached;
@@ -115,7 +125,7 @@ export function loadVoiceBundle({
     // Kick all the loads off in parallel. Shared singletons are
     // memoized so concurrent voice loads share them.
     const [sessions, tokenizer, promptMel] = await Promise.all([
-      getSharedSessions(onProgress),
+      getSharedSessions(onProgress, onPhase),
       getTokenizer(),
       loadPromptMel(voiceId),
     ]);
