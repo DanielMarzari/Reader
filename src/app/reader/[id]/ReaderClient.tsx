@@ -1,10 +1,30 @@
 "use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TTSProvider } from "@/components/tts/TTSContext";
 import { AudiobookProvider } from "@/components/tts/AudiobookProvider";
-import { BrowserInferenceProvider } from "@/components/tts/BrowserInferenceProvider";
+// BrowserInferenceProvider imports onnxruntime-web — specifically the
+// WebGPU bundle (`ort.webgpu.bundle.min.mjs`) via the turbopack alias
+// in next.config.ts. That bundle self-locates at module top-level via
+// `new URL(import.meta.url)`, which throws "Invalid URL" during
+// Turbopack's SSR pass because `import.meta.url` there is a relative
+// `/ _next/static/media/...` path, not absolute. Even though this file
+// and the provider are both "use client", Next still evaluates client
+// modules on the server to pre-render initial HTML — so the ORT
+// bundle is evaluated server-side and crashes SSR.
+//
+// next/dynamic + `ssr: false` creates a true client-only boundary:
+// the provider module is NEVER evaluated on the server, so the ORT
+// import chain doesn't fire until the browser picks up the chunk.
+const BrowserInferenceProvider = dynamic(
+  () =>
+    import("@/components/tts/BrowserInferenceProvider").then((m) => ({
+      default: m.BrowserInferenceProvider,
+    })),
+  { ssr: false }
+);
 import { TTSContent } from "@/components/tts/TTSContent";
 import { TTSPlayerBar } from "@/components/tts/TTSPlayerBar";
 import { PdfPagesViewer } from "@/components/PdfPagesViewer";

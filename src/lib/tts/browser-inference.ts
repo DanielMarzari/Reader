@@ -157,6 +157,111 @@ export type DownloadProgress = {
 
 type OnProgress = (p: DownloadProgress) => void;
 
+/** Chrome Cache Storage has a practical per-entry size limit well below
+ *  500 MB — empirically, ~250 MB puts succeed but 500 MB fails with
+ *  `UnknownError: Failed to execute 'put' on 'Cache': Unexpected internal
+ *  error.` The quota manager has ~3 GB free per origin, so this is a
+ *  per-entry ceiling, not an origin-wide one. Our fm_decoder.onnx is
+ *  477 MB FP32, so single-entry cache.put() blows up every time.
+ *
+ *  Fix: split large buffers into fixed-size chunks, store each chunk
+ *  under `${url}?__chunk=${i}`, and keep a manifest entry at `${url}`
+ *  with `X-Content-Chunks` + `X-Content-Total-Bytes` headers. Reads
+ *  concatenate all chunks back into a single ArrayBuffer.
+ *
+ *  Why query strings and not URL fragments: Cache.put() strips URL
+ *  fragments per the Service Worker spec (step 6 of the Put algorithm
+ *  clones the request with fragment := null). So `${url}#chunk-0` and
+ *  `${url}#chunk-1` both resolve to the SAME cache key, and each put
+ *  silently overwrites the previous. Query strings are preserved —
+ *  `${url}?__chunk=0` and `${url}?__chunk=1` are distinct entries by
+ *  default (Cache.match's `ignoreSearch` option defaults to false).
+ *
+ *  A previous version of this code used fragments and appeared to work
+ *  (manifest header showed chunks=8, page rendered) but the chunks were
+ *  actually absent — every playback silently re-downloaded 477 MB from
+ *  the network. Verified via a keys() probe returning fewer entries
+ *  than writes.
+ *
+ *  64 MB chunks are safely below the limit and fit comfortably in
+ *  memory during concat. fm_decoder → 8 chunks; text_encoder (~18 MB)
+ *  and vocos (~27 MB) → 1 chunk each; prompt-mel (~240 KB) → 1 chunk. */
+const CACHE_CHUNK_SIZE = 64 * 1024 * 1024;
+
+/** Build a chunk URL from a base URL, preserving any pre-existing
+ *  query string. We want `${base}?a=b&__chunk=0` not `${base}?a=b?__chunk=0`. */
+function chunkUrl(baseUrl: string, index: number): string {
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  return `${baseUrl}${sep}__chunk=${index}`;
+}
+
+async function cachePutChunked(
+  cache: Cache,
+  url: string,
+  buf: ArrayBuffer
+): Promise<void> {
+  const total = buf.byteLength;
+  const chunkCount = Math.max(1, Math.ceil(total / CACHE_CHUNK_SIZE));
+  const u8 = new Uint8Array(buf);
+
+  // Write chunks first; manifest last. If we crash mid-write, the next
+  // load sees no manifest and re-downloads — orphaned chunks get
+  // overwritten on the retry or purged by a CACHE_NAME bump.
+  for (let i = 0; i < chunkCount; i++) {
+    const start = i * CACHE_CHUNK_SIZE;
+    const end = Math.min(start + CACHE_CHUNK_SIZE, total);
+    // slice() copies — important: we can't hand the underlying
+    // ArrayBuffer to multiple Response() calls because each Response
+    // detaches or shares the backing storage, and we still need the
+    // full buffer in-memory to return to the caller.
+    const chunk = u8.slice(start, end);
+    await cache.put(chunkUrl(url, i), new Response(chunk));
+  }
+
+  const hdrs = new Headers({
+    "X-Content-Chunks": String(chunkCount),
+    "X-Content-Total-Bytes": String(total),
+  });
+  await cache.put(url, new Response(new Blob([]), { headers: hdrs }));
+}
+
+async function cacheGetChunked(
+  cache: Cache,
+  url: string
+): Promise<ArrayBuffer | null> {
+  const manifest = await cache.match(url);
+  if (!manifest) return null;
+
+  const chunksHdr = manifest.headers.get("X-Content-Chunks");
+  if (!chunksHdr) {
+    // Legacy (pre-chunking) entry written by an older version. Body
+    // holds the full blob directly. Safe to return as-is.
+    return manifest.arrayBuffer();
+  }
+
+  const chunkCount = parseInt(chunksHdr, 10);
+  const totalBytes = parseInt(
+    manifest.headers.get("X-Content-Total-Bytes") || "0",
+    10
+  );
+  if (!chunkCount || !totalBytes) {
+    // Corrupt manifest — force re-download.
+    return null;
+  }
+
+  const out = new Uint8Array(totalBytes);
+  let pos = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    const r = await cache.match(chunkUrl(url, i));
+    if (!r) return null; // missing chunk — treat as miss, re-download
+    const chunk = new Uint8Array(await r.arrayBuffer());
+    out.set(chunk, pos);
+    pos += chunk.byteLength;
+  }
+  if (pos !== totalBytes) return null; // sanity
+  return out.buffer;
+}
+
 /** Fetch a URL with Cache Storage lookup + progress callbacks.
  *  Returns the resource as an ArrayBuffer. Large blobs (hundreds of MB)
  *  land here, so we reuse the ArrayBuffer directly when creating the
@@ -166,17 +271,16 @@ export async function fetchCachedWithProgress(
   onProgress?: OnProgress
 ): Promise<ArrayBuffer> {
   const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match(url);
+  const cached = await cacheGetChunked(cache, url);
   if (cached) {
     // Cached — report a single "100%" event then return bytes.
-    const buf = await cached.arrayBuffer();
     onProgress?.({
       url,
-      bytesReceived: buf.byteLength,
-      bytesTotal: buf.byteLength,
+      bytesReceived: cached.byteLength,
+      bytesTotal: cached.byteLength,
       fraction: 1,
     });
-    return buf;
+    return cached;
   }
 
   // Not cached: stream the download, mirror into Cache Storage.
@@ -189,7 +293,7 @@ export async function fetchCachedWithProgress(
   if (!reader) {
     // No streaming reader (very old browser): fall back to full buffer.
     const buf = await resp.arrayBuffer();
-    await cache.put(url, new Response(buf));
+    await cachePutChunked(cache, url, buf);
     onProgress?.({
       url,
       bytesReceived: buf.byteLength,
@@ -222,9 +326,9 @@ export async function fetchCachedWithProgress(
     pos += c.byteLength;
   }
 
-  // Store a copy in Cache Storage. Use a fresh Response so the body
-  // isn't already consumed.
-  await cache.put(url, new Response(merged.buffer));
+  // Mirror to Cache Storage in ≤64 MB chunks so large models survive
+  // Chrome's per-entry limit.
+  await cachePutChunked(cache, url, merged.buffer);
 
   return merged.buffer;
 }
@@ -311,6 +415,23 @@ export async function createSessions(
     const opts: ort.InferenceSession.SessionOptions = {
       executionProviders: providers,
       graphOptimizationLevel: "all",
+      // ORT's C++ core (the WASM-compiled part) emits a warning like
+      //   [W:onnxruntime: ... VerifyEachNodeIsAssignedToAnEp]
+      //   Some nodes were not assigned to the preferred execution
+      //   providers which may or may not have an negative impact...
+      // every time ANY node of a session lands on CPU under the
+      // WebGPU EP. For our graphs that's normal — shape ops always
+      // prefer CPU — so the warning fires on every session load.
+      // `ort.env.logLevel = "error"` only silences the JS-side
+      // logger; the C++ core has its OWN severity threshold set per
+      // session via this option. 0=verbose 1=info 2=warning 3=error
+      // 4=fatal. Setting to 3 hides the benign warning.
+      //
+      // Why this matters: Next.js dev mode turns console.error into
+      // a full-screen modal overlay, and ORT writes warnings through
+      // stderr which Next.js surfaces as console.error. Without this
+      // suppression, the warning blocks the reader UI on every load.
+      logSeverityLevel: 3,
     };
     const [textEncoder, fmDecoder, vocos] = await Promise.all([
       ort.InferenceSession.create(textEncoderBuf, opts),
