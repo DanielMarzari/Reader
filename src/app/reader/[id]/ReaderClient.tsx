@@ -38,6 +38,7 @@ import {
   saveSettings,
   type ReaderSettings,
 } from "@/components/SettingsDrawer";
+import type { InferenceCapability } from "@/lib/tts/device-capability";
 
 type Props = {
   docId: string;
@@ -100,6 +101,17 @@ export function ReaderClient({
     initialVoiceName
   );
 
+  // Device/browser capability — does the user's setup support the
+  // in-browser ZipVoice pipeline, or do we need to fall through to
+  // the audiobook/Web-Speech path? `null` = still detecting;
+  // `canRun: false` = block + show the CapabilityBanner below.
+  const [capability, setCapability] = useState<InferenceCapability | null>(
+    null
+  );
+  const [capabilityBannerDismissed, setCapabilityBannerDismissed] = useState(
+    false
+  );
+
   useEffect(() => {
     let cancelled = false;
     fetch("/api/voices")
@@ -118,16 +130,70 @@ export function ReaderClient({
     };
   }, []);
 
+  // Kick off capability detection once on mount. Dynamically imported
+  // to keep it out of the SSR evaluation path (it ends up pulling in
+  // browser-inference.ts, which in turn loads the ORT-Web bundle —
+  // ReaderClient is "use client" but Next still evaluates client
+  // modules during pre-render and ORT's `new URL(import.meta.url)`
+  // throws server-side. The dynamic import defers eval to the
+  // browser, mirroring what we do for BrowserInferenceProvider
+  // itself.).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const mod = await import("@/lib/tts/device-capability");
+        const cap = await mod.detectInferenceCapability();
+        if (!cancelled) setCapability(cap);
+      } catch (e) {
+        if (!cancelled) {
+          console.warn("[Reader] capability detection failed:", e);
+          setCapability({
+            deviceClass: "desktop",
+            webgpu: { available: false, reason: "detection threw" },
+            canRun: false,
+            headline: "Can't run voice locally",
+            recommendation:
+              "Capability detection failed — falling back to the queued audiobook or system voice.",
+          });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   /** If a voice is currently selected AND it has prompt_mel available
-   *  AND no audiobook is chosen → mount BrowserInferenceProvider. */
+   *  AND no audiobook is chosen AND the device/browser can actually
+   *  run browser inference → mount BrowserInferenceProvider.
+   *  Otherwise we fall through to the audiobook/Web-Speech path. */
   const browserVoice = useMemo<ReaderVoice | null>(() => {
     if (audiobookVoiceId) return null;
     if (!voices || !browserVoiceId) return null;
+    // Wait for capability detection before committing — avoids
+    // mounting the provider, starting a 660 MB download, then tearing
+    // it down when detection says "nope, you're on iPhone".
+    if (!capability || !capability.canRun) return null;
     const v = voices.find(
       (v) => v.id === browserVoiceId || v.name === browserVoiceId
     );
     return v?.hasPromptMel ? v : null;
-  }, [voices, browserVoiceId, audiobookVoiceId]);
+  }, [voices, browserVoiceId, audiobookVoiceId, capability]);
+
+  /** Would we normally load this voice in the browser, but something
+   *  about the device/browser blocks it? When true the CapabilityBanner
+   *  appears explaining why. */
+  const capabilityBlocks = useMemo<boolean>(() => {
+    if (!voices || !browserVoiceId) return false;
+    if (audiobookVoiceId) return false;
+    if (!capability) return false;
+    if (capability.canRun) return false;
+    const v = voices.find(
+      (v) => v.id === browserVoiceId || v.name === browserVoiceId
+    );
+    return !!v?.hasPromptMel;
+  }, [voices, browserVoiceId, audiobookVoiceId, capability]);
 
   const pagesAvailable = sourceType === "pdf";
 
@@ -313,11 +379,72 @@ export function ReaderClient({
     >
       <div className="min-h-screen flex flex-col">
         {nav}
+        {capabilityBlocks && !capabilityBannerDismissed && capability && (
+          <CapabilityBanner
+            capability={capability}
+            onDismiss={() => setCapabilityBannerDismissed(true)}
+          />
+        )}
         {body}
         {manifestLoading && (
           <div className="fixed top-14 right-4 chip">Loading audiobook…</div>
         )}
       </div>
     </TTSProvider>
+  );
+}
+
+/** Appears at the top of the reader when the user selected a voice
+ *  with `hasPromptMel` (i.e. one capable of in-browser inference) but
+ *  the device/browser can't actually run it — iPhone, no-WebGPU
+ *  Firefox, etc. Explains the situation and points at the
+ *  alternatives (queue audiobook via the nav button, or the system
+ *  voice they're already hearing if they hit play). Dismissible
+ *  because they only need to hear it once per session. */
+function CapabilityBanner({
+  capability,
+  onDismiss,
+}: {
+  capability: InferenceCapability;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      className="mx-3 mt-2 mb-1 rounded-xl border border-amber-300/60 bg-amber-50 dark:bg-amber-950/40 dark:border-amber-500/40 px-3 py-2.5 text-xs shadow-sm flex items-start gap-3"
+    >
+      <svg
+        width="18"
+        height="18"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="shrink-0 mt-[1px] text-amber-600 dark:text-amber-400"
+        aria-hidden="true"
+      >
+        <path d="M12 9v4" />
+        <path d="M12 17h.01" />
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      </svg>
+      <div className="flex-1 min-w-0">
+        <div className="font-semibold text-amber-900 dark:text-amber-200">
+          {capability.headline ?? "Voice unavailable on this device"}
+        </div>
+        <div className="text-amber-900/80 dark:text-amber-200/80 mt-0.5">
+          {capability.recommendation}
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss"
+        className="shrink-0 text-amber-700/70 dark:text-amber-300/70 hover:text-amber-900 dark:hover:text-amber-200 -mt-1 -mr-1 p-1"
+      >
+        ×
+      </button>
+    </div>
   );
 }
