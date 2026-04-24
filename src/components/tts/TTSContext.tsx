@@ -201,7 +201,9 @@ export function TTSProvider({
       synth.cancel();
       manualStopRef.current = false;
 
-      if (startWordIdx >= allWords.length) {
+      // `wordIndexAt` returns -1 when allWords is empty (e.g. image-only PDF
+      // with no extractable text), so guard both ends before indexing.
+      if (startWordIdx < 0 || startWordIdx >= allWords.length) {
         setStatus("idle");
         return;
       }

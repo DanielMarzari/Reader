@@ -1,0 +1,961 @@
+"use client";
+
+// BrowserInferenceProvider — third implementation of the useTTS() shape,
+// alongside the existing TTSProvider (Web Speech API fallback) and
+// AudiobookProvider (pre-rendered MP3 chunks).
+//
+// This one runs ZipVoice-Distill directly in the browser via
+// onnxruntime-web + WebGPU. Synthesizes one sentence at a time, plays
+// via Web Audio API, pre-fetches the next sentence while the current
+// one plays so perceived latency is roughly the first-sentence
+// synthesis cost.
+//
+// Mounts under the same `TTSContext` as the other two providers, so
+// <TTSContent/> + <TTSPlayerBar/> work unchanged regardless of which
+// provider the page chose.
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { tokenize, wordIndexAt, type Tokenized } from "@/lib/tokenize";
+import { defaultAutoSkip, type AutoSkipSettings } from "@/lib/autoskip";
+import type { ReaderVoice } from "@/types/voice";
+import { TTSContext, type TTSContextValue, type Status } from "./TTSContext";
+import {
+  loadVoiceBundle,
+  type VoiceBundle,
+} from "@/lib/tts/voice-bundle";
+import { synthesizeSentence } from "@/lib/tts/synth";
+import { VOCOS_ISTFT_CONFIG } from "@/lib/tts/istft";
+import type {
+  DownloadProgress,
+  CreateSessionsPhase,
+} from "@/lib/tts/browser-inference";
+
+// ---------- Module-level sentence sample cache ----------
+//
+// Keyed on `${voiceId}|${docId}|${sentenceIdx}|${textHash}` so navigating
+// document → back → document doesn't re-synth. We cache raw Float32
+// samples (AudioContext-independent) and rebuild an AudioBuffer per
+// playback — AudioBuffers are tied to a specific AudioContext that
+// gets destroyed on unmount, so reusing the BUFFER across provider
+// instances fails. Samples Just Work.
+//
+// ~3s of audio = 72 KB (24 kHz × 3 × 4 bytes). Cap at 200 sentences
+// ≈ 14 MB for a long doc. Trivially fits in memory.
+
+type SentenceSamples = Float32Array;
+
+const _sentenceCache = new Map<string, SentenceSamples>();
+const SENTENCE_CACHE_MAX = 200;
+
+function cacheKey(
+  voiceId: string,
+  docId: string,
+  sentenceIdx: number,
+  text: string
+): string {
+  // FNV-1a of the text guards against stale entries if the doc
+  // content mutates under a fixed id. Collisions are harmless — we
+  // just re-synth.
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${voiceId}|${docId}|${sentenceIdx}|${(h >>> 0).toString(36)}`;
+}
+
+function cacheGet(key: string): SentenceSamples | null {
+  return _sentenceCache.get(key) ?? null;
+}
+
+function cachePut(key: string, samples: SentenceSamples) {
+  if (_sentenceCache.size >= SENTENCE_CACHE_MAX) {
+    const oldest = _sentenceCache.keys().next().value;
+    if (oldest) _sentenceCache.delete(oldest);
+  }
+  _sentenceCache.set(key, samples);
+}
+
+const SPEED_CYCLE = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5] as const;
+
+// When Web Audio doesn't give us word-level timing (ZipVoice doesn't),
+// we fall back to a fixed words-per-second estimate to drive highlight
+// advancement. Matches TTSProvider's fallback constant.
+const WORDS_PER_SECOND = 2.5;
+
+export type BrowserInferenceProviderStatus =
+  | { kind: "idle" }
+  | {
+      kind: "loading-voice";
+      progress: Record<string, DownloadProgress>;
+      /** "downloading" until all three ONNX buffers are in memory, then
+       *  flips to "compiling" while ORT builds InferenceSessions. The
+       *  compile phase has no byte progress but takes 3–5 s on a fresh
+       *  load, so we surface it separately in the chip. */
+      phase: CreateSessionsPhase;
+    }
+  | { kind: "voice-error"; message: string }
+  | { kind: "ready" };
+
+export function BrowserInferenceProvider({
+  docId,
+  content,
+  voiceId,
+  selectedVoice,
+  voices,
+  voicesLoading,
+  initialCharIndex,
+  initialRate,
+  clickToListen,
+  onVoiceChange,
+  children,
+}: {
+  docId: string;
+  content: string;
+  voiceId: string;
+  selectedVoice: ReaderVoice;
+  voices: ReaderVoice[];
+  voicesLoading: boolean;
+  initialCharIndex: number;
+  initialRate: number;
+  clickToListen: boolean;
+  onVoiceChange: (id: string) => void;
+  autoSkip?: AutoSkipSettings;
+  children: React.ReactNode;
+}) {
+  // ---------- Text tokenization ----------
+  const tokens = useMemo<Tokenized>(() => {
+    const t = tokenize(content);
+    console.log(
+      `[Browser] Tokenized content: ${t.words.length} words, ${t.sentences.length} sentences`
+    );
+    if (t.words.length === 0) {
+      console.warn(
+        "[Browser] Document has no extractable text — Play will be a no-op."
+      );
+    }
+    return t;
+  }, [content]);
+  const { words: allWords, sentences: allSentences } = tokens;
+  const hasText = allWords.length > 0;
+
+  // ---------- Playback state ----------
+  const [status, setStatus] = useState<Status>("idle");
+  const [rate, setRate] = useState(initialRate);
+  const [currentWordIdx, setCurrentWordIdx] = useState<number>(() =>
+    wordIndexAt(allWords, initialCharIndex)
+  );
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  // ---------- Voice bundle (lazy-loaded on voice select) ----------
+  const [bundle, setBundle] = useState<VoiceBundle | null>(null);
+  const [providerStatus, setProviderStatus] =
+    useState<BrowserInferenceProviderStatus>({ kind: "idle" });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!voiceId || !selectedVoice) return;
+    if (bundle && bundle.voiceId === voiceId) return;
+    const promptText =
+      (selectedVoice.design.prompt_text as string | undefined) ?? "";
+    console.log(
+      `[Browser] Starting voice bundle load for "${selectedVoice.name}" (id=${voiceId})`
+    );
+    setProviderStatus({
+      kind: "loading-voice",
+      progress: {},
+      phase: "downloading",
+    });
+    setBundle(null);
+    loadVoiceBundle({
+      voiceId,
+      promptText,
+      onProgress: (p) => {
+        if (cancelled) return;
+        setProviderStatus((prev) =>
+          prev.kind === "loading-voice"
+            ? {
+                kind: "loading-voice",
+                progress: { ...prev.progress, [p.url]: p },
+                phase: prev.phase,
+              }
+            : prev
+        );
+      },
+      onPhase: (phase) => {
+        if (cancelled) return;
+        console.log(`[Browser] Load phase → ${phase}`);
+        setProviderStatus((prev) =>
+          prev.kind === "loading-voice"
+            ? { kind: "loading-voice", progress: prev.progress, phase }
+            : prev
+        );
+      },
+    })
+      .then((b) => {
+        if (cancelled) return;
+        console.log(`[Browser] Voice bundle ready for voiceId=${voiceId}`);
+        setBundle(b);
+        setProviderStatus({ kind: "ready" });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.error("[Browser] Voice bundle load failed:", e);
+        setProviderStatus({
+          kind: "voice-error",
+          message: (e as Error).message,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [voiceId, selectedVoice, bundle]);
+
+  // ---------- Audio context + playback queue ----------
+  // Strategy: sentence samples cached at module scope (persists across
+  // navigations). Per-call prefetch cache holds in-flight synthesis
+  // promises so multiple getSentenceSamples calls for the same sentence
+  // dedupe to one WebGPU run.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const playbackStartedAtRef = useRef<number>(0);
+  const currentSentenceIdxRef = useRef<number>(0);
+  const pendingRef = useRef<Map<number, Promise<Float32Array>>>(new Map());
+  const stopRequestedRef = useRef(false);
+  /** True when the user clicked Play before the voice bundle finished
+   *  loading. The bundle-ready effect consumes this flag to auto-start
+   *  playback, so the play button's loading spinner transitions directly
+   *  to "playing" without the user having to click twice. */
+  const pendingPlayRef = useRef(false);
+  /** True while an AudioBufferSourceNode is actively emitting audio.
+   *  Separate from `status` because we want the highlight tick to
+   *  advance only during actual playback, not during the synth gaps
+   *  before sentence N+1's audio starts. */
+  const isPlayingAudioRef = useRef(false);
+  /** Sentence currently being synthesized for the first time (shown in
+   *  the UI so the user knows why there's a delay). null = not synthing. */
+  const [synthesizingSentenceIdx, setSynthesizingSentenceIdx] = useState<
+    number | null
+  >(null);
+  /** Last synth error, if any. Surfaced as a dismissible chip so the
+   *  user + devtools can see WHY playback stopped. */
+  const [synthError, setSynthError] = useState<{
+    sentenceIdx: number;
+    message: string;
+  } | null>(null);
+
+  // Compute which sentence the currentWordIdx belongs to — drives
+  // highlight at the sentence tier.
+  const currentSentenceIdx = useMemo(() => {
+    if (currentWordIdx < 0 || !allWords[currentWordIdx]) return 0;
+    return allWords[currentWordIdx].sentenceIndex;
+  }, [currentWordIdx, allWords]);
+
+  const firstWordOfSentence = useCallback(
+    (sentenceIdx: number): number => {
+      for (let i = 0; i < allWords.length; i++) {
+        if (allWords[i].sentenceIndex === sentenceIdx) return i;
+      }
+      return 0;
+    },
+    [allWords]
+  );
+
+  const lastWordOfSentence = useCallback(
+    (sentenceIdx: number): number => {
+      let last = -1;
+      for (let i = 0; i < allWords.length; i++) {
+        if (allWords[i].sentenceIndex === sentenceIdx) last = i;
+        else if (last >= 0) break;
+      }
+      return last;
+    },
+    [allWords]
+  );
+
+  const sentenceText = useCallback(
+    (sentenceIdx: number): string => {
+      const s = allSentences[sentenceIdx];
+      if (!s) return "";
+      return content.slice(s.start, s.end).trim();
+    },
+    [allSentences, content]
+  );
+
+  // ---------- Synthesis ----------
+
+  /** Synthesize a sentence → Float32 samples. Uses the module-level
+   *  cache for cross-session reuse; in-flight synth calls dedupe via
+   *  pendingRef so a prefetch + a play() of the same sentence only
+   *  kick off one WebGPU run. */
+  const getSentenceSamples = useCallback(
+    (sentenceIdx: number): Promise<Float32Array> => {
+      const existing = pendingRef.current.get(sentenceIdx);
+      if (existing) return existing;
+
+      const promise = (async () => {
+        if (!bundle) throw new Error("Voice bundle not loaded");
+        const text = sentenceText(sentenceIdx);
+        if (!text) throw new Error(`Empty sentence ${sentenceIdx}`);
+
+        const key = cacheKey(bundle.voiceId, docId, sentenceIdx, text);
+        const cached = cacheGet(key);
+        if (cached) return cached;
+
+        // Mark as synthesizing for the UI — only if nobody else beat
+        // us to it (race with prefetch).
+        setSynthesizingSentenceIdx((cur) => (cur == null ? sentenceIdx : cur));
+        try {
+          const { samples } = await synthesizeSentence(bundle, text);
+          cachePut(key, samples);
+          return samples;
+        } finally {
+          setSynthesizingSentenceIdx((cur) =>
+            cur === sentenceIdx ? null : cur
+          );
+        }
+      })();
+
+      promise.catch(() => pendingRef.current.delete(sentenceIdx));
+      pendingRef.current.set(sentenceIdx, promise);
+      return promise;
+    },
+    [bundle, docId, sentenceText]
+  );
+
+  /** Turn Float32 samples into an AudioBuffer on the shared context. */
+  const buildBuffer = useCallback((samples: Float32Array): AudioBuffer => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext({
+        sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
+      });
+    }
+    const ctx = audioCtxRef.current;
+    const buf = ctx.createBuffer(1, samples.length, ctx.sampleRate);
+    buf.copyToChannel(
+      samples as unknown as Float32Array<ArrayBuffer>,
+      0
+    );
+    return buf;
+  }, []);
+
+  /** Ref that always points at the latest `playSentence`. `onended` reads
+   *  from this ref instead of capturing `playSentence` directly — otherwise
+   *  an onended callback registered when sentence N starts holds a closure
+   *  over the version of `playSentence` from THAT render, and when one of
+   *  playSentence's deps changes later (rate, bundle, getSentenceSamples)
+   *  the stale closure would recurse into a ghost of the previous render.
+   *  Refs sidestep the closure-capture problem entirely. */
+  const playSentenceRef = useRef<
+    ((sentenceIdx: number) => Promise<void>) | null
+  >(null);
+
+  /** Start playback of a sentence. Called:
+   *  - directly from play() on the first Play click
+   *  - recursively via `src.onended` (through playSentenceRef) to advance
+   *    to sentence N+1 once N's audio naturally finishes
+   *  - from seekToWord on user seek
+   *
+   *  Prefetch deliberately removed — single-threaded ORT-Web+WebGPU can't
+   *  actually run two sentence syntheses in parallel; interleaving makes
+   *  each slower. Closing the sentence-gap is Workstream C. */
+  const playSentence = useCallback(
+    async (sentenceIdx: number) => {
+      if (!bundle) return;
+      if (sentenceIdx >= allSentences.length) {
+        isPlayingAudioRef.current = false;
+        setStatus("idle");
+        return;
+      }
+      stopRequestedRef.current = false;
+      currentSentenceIdxRef.current = sentenceIdx;
+      setCurrentWordIdx(firstWordOfSentence(sentenceIdx));
+      // Flip to "loading" so the play button shows a spinner while
+      // synth runs. Cached sentences settle back to "playing" within
+      // a microtask, so the flash is invisible; uncached ones stay
+      // on the spinner for the ~3-10 s synth window.
+      setStatus("loading");
+      console.log(
+        `[Browser] playSentence(${sentenceIdx}) begin — cache hit? ${
+          pendingRef.current.has(sentenceIdx) ||
+          cacheGet(
+            cacheKey(
+              bundle.voiceId,
+              docId,
+              sentenceIdx,
+              sentenceText(sentenceIdx)
+            )
+          ) != null
+        }`
+      );
+
+      let samples: Float32Array;
+      try {
+        samples = await getSentenceSamples(sentenceIdx);
+      } catch (e) {
+        const msg = (e as Error).message;
+        console.error(
+          `[Browser] sentence ${sentenceIdx} synth failed:`,
+          e
+        );
+        setSynthError({ sentenceIdx, message: msg });
+        isPlayingAudioRef.current = false;
+        setStatus("idle");
+        return;
+      }
+      if (stopRequestedRef.current) return; // user paused/seeked during synth
+
+      if (samples.length === 0) {
+        // Degenerate synth output → onended would fire instantly and we'd
+        // recurse into sentence N+1 with no audible gap, but the UI would
+        // show "playing" for a single-sample blip. Skip forward instead.
+        console.warn(
+          `[Browser] sentence ${sentenceIdx} produced 0 samples — skipping`
+        );
+        isPlayingAudioRef.current = false;
+        void playSentenceRef.current?.(sentenceIdx + 1);
+        return;
+      }
+
+      const ctx =
+        audioCtxRef.current ??
+        (audioCtxRef.current = new AudioContext({
+          sampleRate: VOCOS_ISTFT_CONFIG.sampleRate,
+        }));
+
+      // Defensive resume. Chrome/Firefox sometimes auto-suspend the ctx
+      // after a silent stretch (e.g. the ~3–10 s synth gap between
+      // sentence N ending and N+1 starting). Calling `resume()` from a
+      // non-user-gesture path USUALLY works for ctxs that were already
+      // resumed once, but in some browser versions it resolves without
+      // actually transitioning to "running" — hence the post-check + log.
+      // (Cast is because lib.dom types lag on `AudioContextState` — the
+      // spec now includes "running" and "interrupted" but TS's union
+      // here only exposes the non-running states, so `!== "running"`
+      // comparisons trip TS2367.)
+      const ctxState = () => ctx.state as "running" | "suspended" | "closed" | "interrupted";
+      if (ctxState() !== "running") {
+        const prevState = ctxState();
+        try {
+          await ctx.resume();
+        } catch (e) {
+          console.warn("[Browser] ctx.resume() threw:", e);
+        }
+        console.log(
+          `[Browser] AudioContext resume attempt: ${prevState} → ${ctxState()}`
+        );
+        if (ctxState() !== "running") {
+          // The browser is blocking us from restarting. Surface this
+          // clearly so the user knows to click Play again (which runs
+          // inside a user gesture and will resume reliably).
+          setSynthError({
+            sentenceIdx,
+            message:
+              "Audio was paused by the browser. Click Play again to resume.",
+          });
+          isPlayingAudioRef.current = false;
+          setStatus("paused");
+          return;
+        }
+      }
+
+      // Tear down any previous source. It may already have ended
+      // naturally (onended fired) or been stopped explicitly by a
+      // seek — either way, detaching + stopping is idempotent.
+      if (currentSourceRef.current) {
+        try {
+          currentSourceRef.current.onended = null;
+          currentSourceRef.current.stop();
+        } catch {
+          /* already stopped */
+        }
+        currentSourceRef.current = null;
+      }
+
+      const buffer = buildBuffer(samples);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.playbackRate.value = rate;
+      src.connect(ctx.destination);
+      currentSourceRef.current = src;
+      playbackStartedAtRef.current = ctx.currentTime;
+      isPlayingAudioRef.current = true;
+
+      src.onended = () => {
+        // Capture `src` explicitly; `currentSourceRef.current` may have
+        // moved on if seekToWord / pause swapped sources before this
+        // callback fired.
+        if (stopRequestedRef.current) {
+          console.log(
+            `[Browser] onended sentence ${sentenceIdx}: stop requested, bail`
+          );
+          return;
+        }
+        if (currentSourceRef.current !== src) {
+          console.log(
+            `[Browser] onended sentence ${sentenceIdx}: src superseded, bail`
+          );
+          return;
+        }
+        isPlayingAudioRef.current = false;
+        currentSourceRef.current = null;
+        setCurrentWordIdx(firstWordOfSentence(sentenceIdx + 1));
+        // Go through the ref so we always call the LATEST playSentence,
+        // not the one closed over at registration time.
+        const next = playSentenceRef.current;
+        if (!next) {
+          console.warn(
+            `[Browser] onended sentence ${sentenceIdx}: playSentenceRef empty`
+          );
+          return;
+        }
+        void next(sentenceIdx + 1);
+      };
+
+      console.log(
+        `[Browser] playSentence(${sentenceIdx}) start — dur=${(
+          samples.length / ctx.sampleRate
+        ).toFixed(2)}s rate=${rate} ctx=${ctx.state}`
+      );
+      src.start();
+      setStatus("playing");
+    },
+    [
+      bundle,
+      docId,
+      allSentences.length,
+      firstWordOfSentence,
+      getSentenceSamples,
+      buildBuffer,
+      rate,
+      sentenceText,
+    ]
+  );
+
+  // Keep the ref up to date so `onended` always reaches the current
+  // `playSentence` regardless of when the source was created. This
+  // must run after every render where `playSentence` changes; the
+  // layout effect ensures it lands before React paints, so if an
+  // audio callback fires synchronously after a rate change it doesn't
+  // see a stale ref.
+  useEffect(() => {
+    playSentenceRef.current = playSentence;
+  }, [playSentence]);
+
+  // ---------- Word-highlight tick loop ----------
+  //
+  // ZipVoice doesn't emit per-word timings. We drive highlight via
+  // elapsed time × WORDS_PER_SECOND × rate within the current sentence.
+  // Gated on isPlayingAudioRef (not just `status`) so the highlight
+  // stays pinned at the sentence-start word during synth gaps instead
+  // of racing to the end based on a stale playbackStartedAt.
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const ctx = audioCtxRef.current;
+      if (
+        isPlayingAudioRef.current &&
+        status === "playing" &&
+        ctx &&
+        ctx.state === "running"
+      ) {
+        const elapsed = ctx.currentTime - playbackStartedAtRef.current;
+        setElapsedSec(elapsed);
+        const sIdx = currentSentenceIdxRef.current;
+        const firstW = firstWordOfSentence(sIdx);
+        const lastW = lastWordOfSentence(sIdx);
+        const wordsInSentence = lastW - firstW + 1;
+        if (wordsInSentence > 0) {
+          const estWord =
+            firstW +
+            Math.min(
+              wordsInSentence - 1,
+              Math.floor(elapsed * WORDS_PER_SECOND * rate)
+            );
+          setCurrentWordIdx((cur) => (cur !== estWord ? estWord : cur));
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [status, firstWordOfSentence, lastWordOfSentence, rate]);
+
+  // ---------- Controls ----------
+
+  const play = useCallback(() => {
+    console.log(
+      `[Browser] play() — status=${status}, bundle=${bundle ? "ready" : "loading"}, ` +
+        `sentenceIdx=${currentSentenceIdxRef.current}`
+    );
+    if (!bundle) {
+      // User hit play before the ~660 MB voice bundle finished
+      // downloading. Show the spinner now and let the bundle-ready
+      // effect below auto-kick playSentence when the bundle arrives.
+      pendingPlayRef.current = true;
+      setStatus("loading");
+      return;
+    }
+    if (status === "paused" && currentSourceRef.current) {
+      // Web Audio BufferSourceNodes can't be resumed once stopped,
+      // so "pause" suspends the AudioContext instead. Resume here.
+      audioCtxRef.current?.resume();
+      isPlayingAudioRef.current = true;
+      setStatus("playing");
+      return;
+    }
+    void playSentence(currentSentenceIdxRef.current);
+  }, [bundle, status, playSentence]);
+
+  // Consume a pending-play request once the voice bundle finishes
+  // loading. Keeps the click-Play-early UX smooth: one click, spinner,
+  // playback starts on its own as soon as it can.
+  useEffect(() => {
+    if (!bundle) return;
+    if (!pendingPlayRef.current) return;
+    console.log("[Browser] Bundle ready, consuming pending play()");
+    pendingPlayRef.current = false;
+    void playSentence(currentSentenceIdxRef.current);
+  }, [bundle, playSentence]);
+
+  const pause = useCallback(() => {
+    console.log(`[Browser] pause() — status=${status}`);
+    if (status === "loading") {
+      // User clicked the spinner while we were waiting on the bundle
+      // or synthesizing a sentence. Drop the in-flight work and go
+      // back to idle; playSentence's post-await stopRequested guard
+      // will short-circuit before it tries to start audio.
+      pendingPlayRef.current = false;
+      stopRequestedRef.current = true;
+      isPlayingAudioRef.current = false;
+      setStatus("idle");
+      return;
+    }
+    if (status !== "playing") return;
+    // Suspend the AudioContext — keeps our scheduled BufferSourceNode
+    // alive so resume() picks up seamlessly. (If we .stop() here,
+    // onended would fire and auto-advance us.)
+    isPlayingAudioRef.current = false;
+    void audioCtxRef.current?.suspend();
+    setStatus("paused");
+  }, [status]);
+
+  const seekToWord = useCallback(
+    (wordIdx: number, startPlaying = true) => {
+      // Mid-playback clicks should continue playing at the new spot
+      // even when click-to-listen is off — matches TTSProvider's
+      // `shouldPlay = playAfter || status === "playing"` rule. Also
+      // keeps the "loading" state as play-like, so clicking during a
+      // synth gap seeks and keeps synthesizing rather than dropping
+      // silently to idle.
+      const shouldPlay =
+        startPlaying || status === "playing" || status === "loading";
+      stopRequestedRef.current = true;
+      isPlayingAudioRef.current = false;
+      if (currentSourceRef.current) {
+        try {
+          currentSourceRef.current.onended = null;
+          currentSourceRef.current.stop();
+        } catch {
+          /* already stopped */
+        }
+        currentSourceRef.current = null;
+      }
+      const word = allWords[wordIdx];
+      if (!word) return;
+      const sIdx = word.sentenceIndex;
+      currentSentenceIdxRef.current = sIdx;
+      setCurrentWordIdx(wordIdx);
+      // Clear in-flight pending synth promises (stale positions).
+      // The MODULE cache of completed samples is preserved — if we
+      // seek to a sentence we already synth'd, it plays instantly.
+      pendingRef.current.clear();
+      setElapsedSec(0);
+      if (shouldPlay) {
+        void playSentence(sIdx);
+      } else {
+        setStatus("idle");
+      }
+    },
+    [allWords, playSentence, status]
+  );
+
+  const seekToCharOffset = useCallback(
+    (charOffset: number, startPlaying = true) => {
+      seekToWord(wordIndexAt(allWords, charOffset), startPlaying);
+    },
+    [allWords, seekToWord]
+  );
+
+  const skip = useCallback(
+    (seconds: number) => {
+      // Jump ±seconds within the document via the WORDS_PER_SECOND
+      // estimate. Matches TTSProvider's crude seek.
+      const delta = Math.round(seconds * WORDS_PER_SECOND * rate);
+      const next = Math.max(
+        0,
+        Math.min(allWords.length - 1, currentWordIdx + delta)
+      );
+      seekToWord(next, status === "playing");
+    },
+    [rate, currentWordIdx, allWords.length, status, seekToWord]
+  );
+
+  const seekFrac = useCallback(
+    (frac: number) => {
+      const wordIdx = Math.max(
+        0,
+        Math.min(
+          allWords.length - 1,
+          Math.floor(frac * (allWords.length - 1))
+        )
+      );
+      seekToWord(wordIdx, status === "playing");
+    },
+    [allWords.length, seekToWord, status]
+  );
+
+  const cycleRate = useCallback(() => {
+    const idx = SPEED_CYCLE.findIndex((r) => r === rate);
+    const next = SPEED_CYCLE[(idx + 1) % SPEED_CYCLE.length];
+    setRate(next);
+    // Apply to currently-playing source immediately.
+    if (currentSourceRef.current) {
+      currentSourceRef.current.playbackRate.value = next;
+    }
+  }, [rate]);
+
+  const jumpToWord = useCallback(
+    (wordIdx: number) => {
+      seekToWord(wordIdx, true);
+    },
+    [seekToWord]
+  );
+
+  const setVoice = useCallback(
+    (id: string) => {
+      // Hand off to the parent — they own the `voiceId` state. We
+      // don't mutate it directly because TTSContext's shape expects
+      // voiceId to be driven by the page (mirrors TTSProvider /
+      // AudiobookProvider).
+      onVoiceChange(id);
+    },
+    [onVoiceChange]
+  );
+
+  // ---------- Cleanup ----------
+  useEffect(() => {
+    return () => {
+      stopRequestedRef.current = true;
+      if (currentSourceRef.current) {
+        try {
+          currentSourceRef.current.stop();
+        } catch {
+          /* already stopped */
+        }
+      }
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => {});
+      }
+    };
+  }, []);
+
+  // ---------- Derived values ----------
+  const totalSec = useMemo(() => {
+    // Rough estimate for progress bar — no real total until
+    // everything has synthesized. Use word count / WORDS_PER_SECOND
+    // as a placeholder.
+    return allWords.length / WORDS_PER_SECOND / rate;
+  }, [allWords.length, rate]);
+
+  const progressPct = useMemo(() => {
+    if (allWords.length === 0) return 0;
+    return Math.min(100, (currentWordIdx / allWords.length) * 100);
+  }, [currentWordIdx, allWords.length]);
+
+  const value = useMemo<TTSContextValue>(
+    () => ({
+      tokens,
+      status,
+      currentWordIdx,
+      currentSentenceIdx,
+      rate,
+      voiceId,
+      selectedVoice,
+      voices,
+      voicesLoading,
+      elapsedSec,
+      totalSec,
+      progressPct,
+      hasText,
+      canPlay: true,
+      clickToListen,
+      play,
+      pause,
+      skip,
+      seekTo: seekToWord,
+      seekToCharOffset,
+      seekFrac,
+      cycleRate,
+      setVoice,
+      jumpToWord,
+    }),
+    [
+      tokens,
+      status,
+      currentWordIdx,
+      currentSentenceIdx,
+      rate,
+      voiceId,
+      selectedVoice,
+      voices,
+      voicesLoading,
+      elapsedSec,
+      totalSec,
+      progressPct,
+      hasText,
+      clickToListen,
+      play,
+      pause,
+      skip,
+      seekToWord,
+      seekToCharOffset,
+      seekFrac,
+      cycleRate,
+      setVoice,
+      jumpToWord,
+    ]
+  );
+
+  return (
+    <TTSContext.Provider value={value}>
+      {providerStatus.kind === "loading-voice" && (
+        <LoadProgress
+          progress={providerStatus.progress}
+          phase={providerStatus.phase}
+        />
+      )}
+      {providerStatus.kind === "voice-error" && (
+        <VoiceLoadError message={providerStatus.message} voiceId={voiceId} />
+      )}
+      {synthesizingSentenceIdx != null && (
+        <SynthesizingChip
+          sentenceIdx={synthesizingSentenceIdx}
+          totalSentences={allSentences.length}
+        />
+      )}
+      {synthError && (
+        <SynthErrorChip
+          sentenceIdx={synthError.sentenceIdx}
+          message={synthError.message}
+          onDismiss={() => setSynthError(null)}
+        />
+      )}
+      {children}
+    </TTSContext.Provider>
+  );
+}
+
+// ---------- Inline loading / error UI ----------
+
+function LoadProgress({
+  progress,
+  phase,
+}: {
+  progress: Record<string, DownloadProgress>;
+  phase: CreateSessionsPhase;
+}) {
+  const items = Object.values(progress);
+  const total = items.reduce((s, p) => s + (p.bytesTotal ?? 0), 0);
+  const received = items.reduce((s, p) => s + p.bytesReceived, 0);
+  const pct = total > 0 ? Math.floor((received / total) * 100) : null;
+  const compiling = phase === "compiling";
+  return (
+    <div className="fixed bottom-4 right-4 z-50 rounded-xl border border-slate-700 bg-slate-900/90 backdrop-blur px-4 py-3 text-xs text-slate-100 shadow-lg max-w-sm">
+      <div className="font-semibold mb-1 flex items-center gap-2">
+        {compiling && (
+          <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+        )}
+        {compiling ? "Warming up voice engine…" : "Preparing voice…"}
+      </div>
+      {compiling ? (
+        <div className="text-slate-400">
+          Compiling ONNX graphs on WebGPU
+        </div>
+      ) : (
+        <div className="text-slate-400">
+          {(received / 1024 / 1024).toFixed(1)} MB
+          {total > 0 && ` / ${(total / 1024 / 1024).toFixed(1)} MB`}
+          {pct != null && ` · ${pct}%`}
+        </div>
+      )}
+      <div className="mt-2 text-[10px] text-slate-500">
+        {compiling
+          ? "One-time per session. Subsequent sentences run instantly."
+          : "One-time download of the ZipVoice model bundle. Cached for next visit."}
+      </div>
+    </div>
+  );
+}
+
+function VoiceLoadError({
+  message,
+  voiceId,
+}: {
+  message: string;
+  voiceId: string;
+}) {
+  return (
+    <div className="fixed bottom-4 right-4 z-50 rounded-xl border border-red-500/50 bg-red-900/70 backdrop-blur px-4 py-3 text-xs text-red-50 shadow-lg max-w-sm">
+      <div className="font-semibold mb-1">Voice unavailable: {voiceId}</div>
+      <div className="text-red-200">{message}</div>
+    </div>
+  );
+}
+
+function SynthesizingChip({
+  sentenceIdx,
+  totalSentences,
+}: {
+  sentenceIdx: number;
+  totalSentences: number;
+}) {
+  return (
+    <div className="fixed bottom-20 right-4 z-40 rounded-full border border-slate-700 bg-slate-900/90 backdrop-blur px-3 py-1.5 text-[11px] text-slate-200 shadow">
+      <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse mr-2 align-middle" />
+      Synthesizing sentence {sentenceIdx + 1}/{totalSentences}…
+    </div>
+  );
+}
+
+function SynthErrorChip({
+  sentenceIdx,
+  message,
+  onDismiss,
+}: {
+  sentenceIdx: number;
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="fixed bottom-32 right-4 z-40 rounded-xl border border-red-500/50 bg-red-900/70 backdrop-blur px-3 py-2 text-[11px] text-red-50 shadow-lg max-w-sm">
+      <div className="font-semibold mb-0.5 flex items-center justify-between gap-3">
+        <span>Sentence {sentenceIdx + 1} failed</span>
+        <button
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          className="text-red-200 hover:text-white"
+        >
+          ×
+        </button>
+      </div>
+      <div className="text-red-200 break-words">{message}</div>
+    </div>
+  );
+}
