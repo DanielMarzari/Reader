@@ -28,7 +28,6 @@ const BrowserInferenceProvider = dynamic(
 import { TTSContent } from "@/components/tts/TTSContent";
 import { TTSPlayerBar } from "@/components/tts/TTSPlayerBar";
 import { PdfPagesViewer } from "@/components/PdfPagesViewer";
-import { QueueVoiceButton } from "@/components/QueueVoiceButton";
 import type { ReaderVoice } from "@/types/voice";
 import {
   SettingsDrawer,
@@ -85,7 +84,8 @@ export function ReaderClient({
 
   // When the user picks an audiobook, we fetch its manifest + mount
   // <AudiobookProvider/> instead of <TTSProvider/>. null = use browser
-  // inference (if voice has prompt_mel) or the Web Speech fallback.
+  // inference (if voice has prompt_mel), otherwise fall through to the
+  // no-playable-voice stub which nudges the user to queue an audiobook.
   const [audiobookVoiceId, setAudiobookVoiceId] = useState<string | null>(null);
   const [audiobookManifest, setAudiobookManifest] = useState<AudiobookManifest | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
@@ -260,16 +260,15 @@ export function ReaderClient({
           {title}
         </div>
         <div className="text-[10px] text-[color:var(--muted)] uppercase tracking-wide">
-          {sourceType} · {wordCount.toLocaleString()} words
+          {sourceType === "pdf" && pageRanges && pageRanges.length > 0
+            ? `PDF · ${pageRanges.length.toLocaleString()} ${
+                pageRanges.length === 1 ? "page" : "pages"
+              }`
+            : `${sourceType} · ${wordCount.toLocaleString()} words`}
         </div>
       </div>
 
       <div className="flex items-center gap-2">
-        <QueueVoiceButton
-          documentId={docId}
-          selectedVoiceId={audiobookVoiceId}
-          onSelectAudiobook={selectAudiobook}
-        />
         <button
           className="btn-ghost"
           onClick={() => setSettingsOpen(true)}
@@ -299,7 +298,11 @@ export function ReaderClient({
           <TTSContent highlightSentence={settings.highlightSentence} />
         )}
       </main>
-      <TTSPlayerBar />
+      <TTSPlayerBar
+        docId={docId}
+        sourceType={sourceType}
+        onLoadAudiobook={selectAudiobook}
+      />
       <SettingsDrawer
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -318,11 +321,31 @@ export function ReaderClient({
   //   2. BrowserInferenceProvider — ZipVoice-Distill running locally
   //      in the browser. Requires the voice to have `hasPromptMel`
   //      (Voice Studio's Clone endpoint ships prompt_mel.f32).
-  //   3. TTSProvider — Web Speech API fallback, always works but uses
-  //      the OS default voice (no cloning).
+  //   3. TTSProvider — "no playable voice" stub. Loads the voice list
+  //      and persists the user's pick, but Play is disabled and the
+  //      player bar shows a "Queue an audiobook" prompt. We do NOT
+  //      fall through to the browser's Web Speech API — we only ever
+  //      play Voice Lab voices, never the OS default voice.
   //
   // Swapping providers tears down the previous playback cleanly via
   // the provider's unmount effect.
+  const chosenProvider = audiobookVoiceId && audiobookManifest
+    ? "AudiobookProvider"
+    : browserVoice && voices
+    ? "BrowserInferenceProvider"
+    : "TTSProvider (no-playable-voice stub)";
+  console.log(
+    `[Reader] Provider selection → ${chosenProvider} ` +
+      `(voices=${voices?.length ?? "loading"}, ` +
+      `browserVoiceId=${browserVoiceId ?? "none"}, ` +
+      `hasPromptMel=${
+        voices?.find((v) => v.id === browserVoiceId || v.name === browserVoiceId)?.hasPromptMel ?? "?"
+      }, ` +
+      `capability.canRun=${capability?.canRun ?? "detecting"}, ` +
+      `audiobookVoiceId=${audiobookVoiceId ?? "none"}, ` +
+      `wordCount=${wordCount})`
+  );
+
   if (audiobookVoiceId && audiobookManifest) {
     return (
       <AudiobookProvider
@@ -373,9 +396,15 @@ export function ReaderClient({
       content={content}
       initialCharIndex={initialCharIndex}
       initialRate={initialRate}
-      initialVoiceName={initialVoiceName}
+      // Prefer the user's latest pick (browserVoiceId) over the
+      // page-load default — otherwise, when the user swaps from a
+      // hasPromptMel voice to one without prompt_mel, we'd unmount
+      // BrowserInferenceProvider and remount this stub with the OLD
+      // voice name, silently reverting the selection they just made.
+      initialVoiceName={browserVoiceId ?? initialVoiceName}
       clickToListen={settings.clickToListen}
       autoSkip={settings.autoSkip}
+      onVoiceChange={setBrowserVoiceId}
     >
       <div className="min-h-screen flex flex-col">
         {nav}
