@@ -4,14 +4,22 @@ on:
   push:
     branches: [main]
 
+# Opt in to Node.js 24 for all JavaScript actions now, ahead of
+# GitHub's June 2 2026 forced cutover. Silences the deprecation
+# warnings on actions/checkout + actions/setup-node and keeps the
+# deploy green past the cutover without requiring action-version
+# bumps.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: "npm"
