@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { insertDocument, listDocuments } from "@/lib/documents";
 import { countWords, parseEpub, parsePdf, parseText, normalize } from "@/lib/parse";
 import { saveOriginal } from "@/lib/files";
+import { triggerOcr } from "@/lib/ocr";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -81,7 +82,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unsupported content-type" }, { status: 400 });
   }
 
-  if (!content.trim()) {
+  // Empty content is a hard failure for text/epub/JSON uploads — there
+  // is nothing we can do to recover text that was never there. But for
+  // PDFs, empty extracted text is the classic signature of a scanned
+  // document: the file has page images but no real text layer. We
+  // accept those and queue auto-OCR below so the Reader lights up once
+  // tesseract finishes.
+  if (!content.trim() && sourceType !== "pdf") {
     return NextResponse.json({ error: "Extracted text is empty" }, { status: 400 });
   }
 
@@ -98,16 +105,26 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  const wordCount = countWords(content);
   insertDocument({
     id,
     title: title.slice(0, 250),
     sourceType,
     originalFilename,
     content,
-    wordCount: countWords(content),
+    wordCount,
     storedPath,
     pageRanges,
   });
+
+  // Scanned PDF auto-OCR: if we just admitted a PDF with no real
+  // words, kick off ocrmypdf in the background. Fire-and-forget — the
+  // upload POST returns immediately so the client can navigate to the
+  // new doc, and <OcrBanner/> on the reader page will pick up the
+  // in-progress job via the /ocr status endpoint.
+  if (sourceType === "pdf" && wordCount === 0) {
+    void triggerOcr(id);
+  }
 
   return NextResponse.json({ id });
 }

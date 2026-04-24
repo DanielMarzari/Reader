@@ -198,6 +198,26 @@ body {
   border-radius: 3px;
   pointer-events: none;
 }
+/* Hover-preview layer. Sits below the "now playing" sentence layer so
+   when the two overlap they compose without hiding the active-sentence
+   tint. Sentence-rect tinting here is much lighter — it's a hint of
+   where a click would jump, not the current read position. */
+.pdf-sentence-hover-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.pdf-sentence-hover-rect {
+  position: absolute;
+  background: rgba(47, 67, 250, 0.07);
+  border-radius: 3px;
+  pointer-events: none;
+  transition: opacity 60ms ease;
+}
+:root[data-theme="dark"] .pdf-sentence-hover-rect,
+:root:not([data-theme="light"]) .pdf-sentence-hover-rect {
+  background: rgba(131, 147, 255, 0.10);
+}
 .pdf-word-pill {
   position: absolute;
   background: rgba(47, 67, 250, 0.30);
@@ -221,7 +241,9 @@ body {
   position: absolute;
   top: 0;
   left: 0;
-  cursor: text;
+  /* Pointer cursor signals "click to jump" affordance; matches the
+     sentence-hover highlight that appears under the cursor. */
+  cursor: pointer;
   background: transparent;
 }
 

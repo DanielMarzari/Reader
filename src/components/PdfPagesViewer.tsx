@@ -59,6 +59,12 @@ export function PdfPagesViewer({
   const pageWrapRefs = useRef<HTMLDivElement[]>([]);
   const wordPillRefs = useRef<HTMLDivElement[]>([]);
   const sentenceOverlayRefs = useRef<HTMLDivElement[]>([]);
+  /** Per-page hover-preview sentence layer. Drawn when the mouse is
+   *  over that page; cleared on mouseleave. Used only when the
+   *  "Highlight sentence" setting is on — matches the existing
+   *  sentence-rect rendering's gate so we don't surprise users who
+   *  intentionally dimmed sentence tinting. */
+  const sentenceHoverOverlayRefs = useRef<HTMLDivElement[]>([]);
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([]);
   // LRU tracking of rendered pages: most-recently-rendered at end.
   const renderedOrder = useRef<number[]>([]);
@@ -279,6 +285,7 @@ export function PdfPagesViewer({
         pageWrapRefs.current = new Array(pdf.numPages);
         wordPillRefs.current = new Array(pdf.numPages);
         sentenceOverlayRefs.current = new Array(pdf.numPages);
+        sentenceHoverOverlayRefs.current = new Array(pdf.numPages);
         canvasRefs.current = new Array(pdf.numPages).fill(null);
 
         for (let i = 0; i < infos.length; i++) {
@@ -300,6 +307,13 @@ export function PdfPagesViewer({
           overlay.className = "pdf-overlay";
           overlay.style.width = `${info.width}px`;
           overlay.style.height = `${info.height}px`;
+
+          // Hover-preview sentence layer goes BELOW the active-sentence
+          // layer so when the user hovers their current-read sentence
+          // the active rect wins visually (already tinted darker).
+          const sentenceHoverLayer = document.createElement("div");
+          sentenceHoverLayer.className = "pdf-sentence-hover-layer";
+          overlay.appendChild(sentenceHoverLayer);
 
           const sentenceLayer = document.createElement("div");
           sentenceLayer.className = "pdf-sentence-layer";
@@ -331,6 +345,7 @@ export function PdfPagesViewer({
           pageWrapRefs.current[i] = wrap;
           wordPillRefs.current[i] = wordPill;
           sentenceOverlayRefs.current[i] = sentenceLayer;
+          sentenceHoverOverlayRefs.current[i] = sentenceHoverLayer;
         }
 
         // IntersectionObserver: render pages that are near viewport
@@ -381,53 +396,168 @@ export function PdfPagesViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId, sourceType]);
 
-  // --- Click hit-testing on the click layer -----------------------------
+  // --- Click + hover hit-testing on the click layer ---------------------
+  // Click: seek playback to the clicked word.
+  // Hover: when `highlightSentence` is on, paint a light sentence-shaped
+  //   overlay on the hovered sentence so the user can preview exactly
+  //   where clicking will jump to. Gated on `highlightSentence` to match
+  //   the existing active-sentence-rect gate — users who dislike
+  //   sentence tinting see no hover either.
   useEffect(() => {
     if (!pagesReady) return;
+    if (!pageRanges) return;
     const handlers: Array<() => void> = [];
+
+    /** Find the item (word-ish bbox) under (x, y). Try exact hit first,
+     *  then fall back to the closest item on the nearest line. */
+    const itemAt = (
+      items: ItemBox[],
+      x: number,
+      y: number
+    ): ItemBox | undefined => {
+      let hit = items.find(
+        (it) =>
+          x >= it.x &&
+          x < it.x + it.width &&
+          y >= it.y &&
+          y < it.y + it.height + 2
+      );
+      if (!hit) {
+        const rowTol = 8;
+        const inRow = items.filter(
+          (it) => Math.abs(it.y - y) < it.height + rowTol
+        );
+        if (inRow.length) {
+          hit = inRow.reduce((best, cur) => {
+            const bd = Math.min(
+              Math.abs(best.x - x),
+              Math.abs(best.x + best.width - x)
+            );
+            const cd = Math.min(
+              Math.abs(cur.x - x),
+              Math.abs(cur.x + cur.width - x)
+            );
+            return cd < bd ? cur : best;
+          });
+        }
+      }
+      return hit;
+    };
+
     for (let i = 0; i < pageWrapRefs.current.length; i++) {
       const wrap = pageWrapRefs.current[i];
       if (!wrap) continue;
       const click = wrap.querySelector(".pdf-click-layer") as HTMLDivElement | null;
       if (!click) continue;
-      const handler = (ev: MouseEvent) => {
+
+      const clickHandler = (ev: MouseEvent) => {
         const page = pagesRef.current[i];
-        if (!page || !page.items || !pageRanges) return;
+        if (!page || !page.items) return;
         const rect = click.getBoundingClientRect();
         const x = ev.clientX - rect.left;
         const y = ev.clientY - rect.top;
-        // Find item whose bbox contains (x, y). Try exact hit, then
-        // fall back to the closest item on the clicked line.
-        let hit = page.items.find(
-          (it) =>
-            x >= it.x &&
-            x < it.x + it.width &&
-            y >= it.y &&
-            y < it.y + it.height + 2
-        );
-        if (!hit) {
-          // Closest on the nearest line
-          const rowTol = 8;
-          const inRow = page.items.filter((it) => Math.abs(it.y - y) < it.height + rowTol);
-          if (inRow.length) {
-            hit = inRow.reduce((best, cur) => {
-              const bd = Math.min(Math.abs(best.x - x), Math.abs(best.x + best.width - x));
-              const cd = Math.min(Math.abs(cur.x - x), Math.abs(cur.x + cur.width - x));
-              return cd < bd ? cur : best;
-            });
-          }
-        }
+        const hit = itemAt(page.items, x, y);
         if (!hit) return;
         const globalOffset = pageRanges[i].charStart + hit.localStart;
         seekToCharOffset(globalOffset, clickToListen);
       };
-      click.addEventListener("click", handler);
-      handlers.push(() => click.removeEventListener("click", handler));
+      click.addEventListener("click", clickHandler);
+      handlers.push(() => click.removeEventListener("click", clickHandler));
+
+      // --- Hover preview (sentence-shaped highlight under the mouse) ---
+      // Track the last-drawn sentence index so we only repaint when
+      // crossing a sentence boundary — otherwise every pixel of mouse
+      // movement would rebuild the overlay DOM.
+      let lastHoverSentence = -1;
+      const clearHover = () => {
+        const overlay = sentenceHoverOverlayRefs.current[i];
+        if (overlay) overlay.innerHTML = "";
+        lastHoverSentence = -1;
+      };
+
+      const moveHandler = (ev: MouseEvent) => {
+        if (!highlightSentence) return;
+        const page = pagesRef.current[i];
+        if (!page || !page.items) return;
+        const overlay = sentenceHoverOverlayRefs.current[i];
+        if (!overlay) return;
+        const rect = click.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        const y = ev.clientY - rect.top;
+        const hit = itemAt(page.items, x, y);
+        if (!hit) {
+          clearHover();
+          return;
+        }
+        const globalOffset = pageRanges[i].charStart + hit.localStart;
+        // Find which sentence this char offset belongs to. Binary-search
+        // would be marginal — docs with > 10k sentences are rare, linear
+        // scan is <1ms.
+        let sIdx = -1;
+        for (let s = 0; s < tokens.sentences.length; s++) {
+          const sent = tokens.sentences[s];
+          if (globalOffset >= sent.start && globalOffset < sent.end) {
+            sIdx = s;
+            break;
+          }
+        }
+        if (sIdx < 0 || sIdx === lastHoverSentence) return;
+        lastHoverSentence = sIdx;
+
+        // Render sentence rects on THIS page only. Cross-page sentence
+        // spills are rare and don't need hover preview on the spillover
+        // page (the mouse isn't there anyway).
+        overlay.innerHTML = "";
+        const sent = tokens.sentences[sIdx];
+        const sentStart = sent.start - pageRanges[i].charStart;
+        const sentEnd = sent.end - pageRanges[i].charStart;
+        const rowItems = page.items.filter(
+          (it) => it.localEnd > sentStart && it.localStart < sentEnd
+        );
+        if (!rowItems.length) return;
+        const tol = 6;
+        const rows: ItemBox[][] = [];
+        for (const it of rowItems) {
+          const row = rows.find((r) => Math.abs(r[0].y - it.y) <= tol);
+          if (row) row.push(it);
+          else rows.push([it]);
+        }
+        for (const row of rows) {
+          const xMin = Math.min(...row.map((it) => it.x));
+          const xMax = Math.max(...row.map((it) => it.x + it.width));
+          const yMin = Math.min(...row.map((it) => it.y));
+          const yMax = Math.max(...row.map((it) => it.y + it.height));
+          const w = xMax - xMin + 4;
+          const h = yMax - yMin + 2;
+          if (w <= 1 || h <= 1) continue;
+          const rectEl = document.createElement("div");
+          rectEl.className = "pdf-sentence-hover-rect";
+          rectEl.style.left = `${xMin - 2}px`;
+          rectEl.style.top = `${yMin - 1}px`;
+          rectEl.style.width = `${w}px`;
+          rectEl.style.height = `${h}px`;
+          overlay.appendChild(rectEl);
+        }
+      };
+      click.addEventListener("mousemove", moveHandler);
+      click.addEventListener("mouseleave", clearHover);
+      handlers.push(() => {
+        click.removeEventListener("mousemove", moveHandler);
+        click.removeEventListener("mouseleave", clearHover);
+        clearHover();
+      });
     }
     return () => {
       for (const off of handlers) off();
     };
-  }, [pagesReady, pageRanges, seekToCharOffset, clickToListen]);
+  }, [
+    pagesReady,
+    pageRanges,
+    seekToCharOffset,
+    clickToListen,
+    highlightSentence,
+    tokens.sentences,
+  ]);
 
   // --- Position overlays on the active page ----------------------------
   useEffect(() => {

@@ -136,6 +136,39 @@ export function updateDocumentTitle(id: string, title: string) {
   ).run(title, id);
 }
 
+/**
+ * Replace a document's text content + per-page char ranges. Used by the
+ * auto-OCR pipeline (src/lib/ocr.ts) once ocrmypdf produces a PDF with
+ * a real text layer and we re-parse it. Mirrors insertDocument's shape
+ * so the data stays identical to a normal upload — char_count comes
+ * from content.length, pages_meta from JSON-encoded pageRanges.
+ */
+export function updateDocumentOcrResult(
+  id: string,
+  patch: {
+    content: string;
+    wordCount: number;
+    pageRanges: Array<{ charStart: number; charEnd: number }> | null;
+  }
+) {
+  const db = getDb();
+  db.prepare(
+    `UPDATE documents
+        SET content = @content,
+            word_count = @wordCount,
+            char_count = @charCount,
+            pages_meta = @pagesMeta,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = @id`
+  ).run({
+    id,
+    content: patch.content,
+    wordCount: patch.wordCount,
+    charCount: patch.content.length,
+    pagesMeta: patch.pageRanges ? JSON.stringify(patch.pageRanges) : null,
+  });
+}
+
 export function upsertPosition(
   id: string,
   charIndex: number,
