@@ -210,8 +210,11 @@ function VoicePickerModal({
           </div>
         )}
 
-        {/* Grid body */}
-        <div className="p-4 overflow-y-auto">
+        {/* Grid body — `flex-1 min-h-0` is load-bearing: without
+            min-h-0, flex children default to min-height:auto (intrinsic
+            content height), so overflow-y-auto never kicks in and the
+            modal grows past max-h-[85vh], pushing the grid off-screen. */}
+        <div className="flex-1 min-h-0 p-4 overflow-y-auto">
           {voicesLoading ? (
             <div className="px-3 py-10 text-sm text-center text-[color:var(--muted)]">
               Loading voices…
