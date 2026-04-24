@@ -120,6 +120,8 @@ export async function synthesizeSentence(
   bundle: VoiceBundle,
   text: string
 ): Promise<SynthResult> {
+  const textPreview = text.length > 48 ? `${text.slice(0, 48)}…` : text;
+  console.log(`[Synth] start → "${textPreview}" (${text.length} chars)`);
   const t0 = performance.now();
 
   // --- Tokenize target (prompt already pre-tokenized in the bundle) ---
@@ -259,6 +261,13 @@ export async function synthesizeSentence(
 
   const totalMs = performance.now() - t0;
   const audioSec = samples.length / VOCOS_ISTFT_CONFIG.sampleRate;
+  const rtf = audioSec / (totalMs / 1000);
+  console.log(
+    `[Synth] done → ${audioSec.toFixed(2)}s audio in ${totalMs.toFixed(0)}ms ` +
+      `(RTF ${rtf.toFixed(2)}×) | te=${textEncoderMs.toFixed(0)}ms ` +
+      `fm=${fmDecoderMs.toFixed(0)}ms vocos=${vocosMs.toFixed(0)}ms ` +
+      `istft=${istftMs.toFixed(0)}ms`
+  );
 
   return {
     samples,
@@ -273,7 +282,7 @@ export async function synthesizeSentence(
       istftMs,
       totalMs,
       audioSec,
-      realTimeFactor: audioSec / (totalMs / 1000),
+      realTimeFactor: rtf,
     },
   };
 }

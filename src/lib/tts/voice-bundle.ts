@@ -122,6 +122,9 @@ export function loadVoiceBundle({
       );
     }
 
+    console.log(`[VoiceBundle] Loading bundle for voiceId=${voiceId}…`);
+    const t0 = performance.now();
+
     // Kick all the loads off in parallel. Shared singletons are
     // memoized so concurrent voice loads share them.
     const [sessions, tokenizer, promptMel] = await Promise.all([
@@ -129,9 +132,18 @@ export function loadVoiceBundle({
       getTokenizer(),
       loadPromptMel(voiceId),
     ]);
+    console.log(
+      `[VoiceBundle] Shared sessions + tokenizer + prompt mel ready (${
+        ((performance.now() - t0) / 1000).toFixed(2)
+      }s)`
+    );
 
     // Tokenize the voice prompt once per voice.
     const tok = await tokenizer.textToTokenIds(promptText, "en-us");
+    console.log(
+      `[VoiceBundle] Tokenized prompt: ${tok.ids.length} phoneme ids, ` +
+        `${tok.skippedChars.length} skipped chars`
+    );
 
     // Precompute scaled prompt mel so per-sentence synth just memcpy's
     // it into the speech_condition buffer.
@@ -149,6 +161,11 @@ export function loadVoiceBundle({
       promptPhonemes: tok.phonemes,
       skippedPromptChars: tok.skippedChars,
     };
+    console.log(
+      `[VoiceBundle] Ready — voiceId=${voiceId}, total=${
+        ((performance.now() - t0) / 1000).toFixed(2)
+      }s`
+    );
     return bundle;
   })();
 

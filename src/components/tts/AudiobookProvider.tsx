@@ -81,8 +81,15 @@ export function AudiobookProvider({
   autoSkip?: AutoSkipSettings;
   children: React.ReactNode;
 }) {
-  const tokens = useMemo<Tokenized>(() => tokenize(content), [content]);
+  const tokens = useMemo<Tokenized>(() => {
+    const t = tokenize(content);
+    console.log(
+      `[Audiobook] Tokenized content: ${t.words.length} words, ${t.sentences.length} sentences`
+    );
+    return t;
+  }, [content]);
   const allWords = tokens.words;
+  const hasText = allWords.length > 0;
 
   const [status, setStatus] = useState<"idle" | "playing" | "paused">("idle");
   const [rate, setRate] = useState(initialRate);
@@ -448,6 +455,8 @@ export function AudiobookProvider({
     elapsedSec,
     totalSec,
     progressPct,
+    hasText,
+    canPlay: true,
     clickToListen,
     play,
     pause,
